@@ -40,10 +40,10 @@ use crate::ime_toggle;
 
 /// 文字字号(像素)
 const FONT_SIZE_PX: f32 = 54.0;
-const PAD_X: i32 = 45;
-const PAD_Y: i32 = 24;
+const PAD_X: i32 = 42;
+const PAD_Y: i32 = 20;
 /// 圆角半径
-const RADIUS: f32 = 38.0;
+const RADIUS: f32 = 16.0;
 /// 浮层中心相对屏幕中心的上移量(像素)
 const LIFT_UP_PX: i32 = 120;
 /// 超采样倍数:按 2x 尺寸绘制,提交前高质量下采样到 1x,
