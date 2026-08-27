@@ -1,12 +1,15 @@
-//! 低级键盘钩子:拦截 CapsLock,改键为 Ctrl+Space(输入法切换),
-//! Alt+CapsLock 透传为原生大小写切换。
+//! 低级键盘钩子:拦截 CapsLock,改键行为:
+//! 1. CapsLock      -> 投递切换请求,浮层线程执行 API 直切(失败回退 Ctrl+Space)
+//! 2. Alt+CapsLock  -> 透传原生大小写切换,并显示 大写/小写 浮层
+//!
+//! 铁律:钩子回调里只做 O(1) 的判断和 PostMessage,任何阻塞调用
+//! (AttachThreadInput/SendMessageTimeout/SendInput)都会让系统超时摘钩。
 
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CAPITAL, VK_LCONTROL,
-    VK_LMENU, VK_RMENU, VK_SPACE,
+    GetKeyState, VK_CAPITAL, VK_LMENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_INJECTED, LLKHF_UP, MSG,
@@ -15,8 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::overlay;
 
-/// 标记我们用 SendInput 注入的按键,避免钩子再次拦截造成死循环。
-const INJECTED_FLAG: usize = 0x1;
+// 标记注入按键的 dwExtraInfo(注入逻辑在 ime_toggle,此处仅识别)
+use crate::ime_toggle::INJECTED_FLAG;
 
 /// 缓存 Alt 键状态:0 = 松开,非 0 = 按下。
 /// 用 GetAsyncKeyState 轮询在低级钩子里不可靠,直接在钩子回调里跟踪。
@@ -29,8 +32,8 @@ pub unsafe fn run() {
             .expect("安装键盘钩子失败(尝试以管理员身份运行)");
 
         println!("capslock-switcher 已启动:");
-        println!("  CapsLock       -> Ctrl+Space");
-        println!("  Alt+CapsLock   -> 原生 CapsLock(切换大小写)");
+        println!("  CapsLock       -> API 直切输入法中/英(回退 Ctrl+Space)");
+        println!("  Alt+CapsLock   -> 原生大小写切换 + 大写/小写浮层");
         println!("按 Ctrl+C 或关闭窗口退出。");
 
         let mut msg = MSG::default();
@@ -78,44 +81,20 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         let alt_down = kb.flags.contains(LLKHF_ALTDOWN) || ALT_DOWN.load(Ordering::SeqCst) != 0;
 
         if alt_down {
-            // Alt+CapsLock:透传原生 CapsLock 行为(切换大小写)
+            // Alt+CapsLock:透传给系统切换大小写;松开时 CapsLock 状态已翻转,
+            // 那时读 GetKeyState 才是切换后的新状态,所以浮层放在松开事件里显示。
+            if is_up {
+                let caps_on = GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0;
+                overlay::show_caps_overlay(caps_on);
+            }
             CallNextHookEx(None, code, wparam, lparam)
         } else {
-            // CapsLock:吞掉,注入 Ctrl+Space
-            send_ctrl_space();
-            // 切换完成后弹出语言指示浮层
+            // CapsLock:吞掉,向浮层线程投递「切换 + 显示」请求。
+            // 切换动作(AttachThreadInput/SendMessageTimeout/SendInput)都是阻塞调用,
+            // 绝不能在低级钩子回调里执行——超时几次后系统会静默摘除钩子。
+            println!("[hook] CapsLock 按下,投递切换请求");
             overlay::show_language_overlay();
             LRESULT(1) // 非零返回值 = 吞掉该按键,不传递给系统
         }
     }
-}
-
-/// 注入一次完整的 Ctrl+Space 按下与松开
-unsafe fn send_ctrl_space() {
-    fn key(vk: u16, up: bool) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
-                    wScan: 0,
-                    dwFlags: if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        Default::default()
-                    },
-                    time: 0,
-                    dwExtraInfo: INJECTED_FLAG,
-                },
-            },
-        }
-    }
-
-    let inputs = [
-        key(VK_LCONTROL.0, false),
-        key(VK_SPACE.0, false),
-        key(VK_SPACE.0, true),
-        key(VK_LCONTROL.0, true),
-    ];
-    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }

@@ -1,56 +1,50 @@
-//! 语言指示浮层:输入法切换完成后,在屏幕中央短暂显示当前输入语言。
+//! 语言指示浮层:切换完成后,在屏幕中央短暂显示当前输入状态。
 //!
-//! EN 蓝色 / 中 红色 / 日 黄色 / 韩 黑色,显示 0.3s 后再用 0.3s 淡出消失。
-//! 检测方式:前台窗口所在线程的键盘布局(HKL)定语种,
-//! 再经 AttachThreadInput 后用 ImmGetContext + ImmGetConversionStatus
-//! 读取前台输入上下文的真实转换状态,区分本国语言模式与英文模式。
+//! 渲染:GDI+ 反锯齿绘制 32-bit 预乘 ARGB 位图,UpdateLayeredWindow 上屏,
+//! 圆角与文字边缘均为逐像素 alpha,平滑无锯齿(AHK 同款效果)。
+//! 淡出:每 tick 重绘带全局 alpha 的位图再提交。
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BeginPaint, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, EndPaint, FF_DONTCARE, FW_SEMIBOLD, FillRect,
-    GetDC, GetStockObject, GetTextExtentPoint32W, HFONT, InvalidateRect, NULL_PEN,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT, TextOutW, UpdateWindow,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, SelectObject,
+};
+use windows::Win32::Graphics::GdiPlus::{
+    FillModeAlternate, FontStyleBold, GdipAddPathArc, GdipClosePathFigure,
+    GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreatePath,
+    GdipCreateSolidFill, GdipCreateStringFormat, GdipDeleteBrush, GdipDeleteFont,
+    GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeleteStringFormat,
+    GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext, GdipMeasureString,
+    GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
+    GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput,
+    GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias, Status,
+    StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::Input::Ime::{
-    ImmGetContext, ImmGetConversionStatus, ImmGetDefaultIMEWnd, ImmGetOpenStatus,
-    IME_CONVERSION_MODE,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, HWND_TOPMOST, KillTimer, LWA_ALPHA,
-    LWA_COLORKEY, MSG, MoveWindow, PostMessageW, PostQuitMessage, PostThreadMessageW,
-    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageTimeoutW, SetLayeredWindowAttributes,
-    SetTimer, SetWindowPos, ShowWindow, WM_APP, WM_DESTROY, WM_IME_CONTROL, WM_PAINT, WM_QUIT,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, KillTimer,
+    MSG, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXSCREEN,
+    SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetTimer, SetWindowPos,
+    ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_DESTROY, WM_QUIT, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows::core::w;
 
-// windows crate 未导出的 IME 常量(imm.h)
-/// 转换模式中的「本国语言输入」位:置位 = 中文/假名/韩文模式
-const IME_CMODE_NATIVE: u32 = 0x0001;
-/// WM_IME_CONTROL:查 IME 开启状态
-const IMC_GETOPENSTATUS: u32 = 0x0005;
-/// WM_IME_CONTROL:查转换模式
-const IMC_GETCONVERSIONMODE: u32 = 0x0001;
+use crate::ime_toggle;
 
 // ---- 可视参数 ----
 
 /// 文字字号(像素)
-const FONT_SIZE_PX: i32 = 24;
-const PAD_X: i32 = 20;
+const FONT_SIZE_PX: f32 = 24.0;
+const PAD_X: i32 = 22;
 const PAD_Y: i32 = 12;
-/// 注入 Ctrl+Space 后等待输入法状态落定的延时
+/// 圆角半径
+const RADIUS: f32 = 14.0;
+/// 切换后等待输入法状态落定的延时
 const READ_DELAY_MS: u32 = 20;
 /// 完全显示的持续时间
 const SHOW_MS: u32 = 300;
@@ -58,55 +52,73 @@ const SHOW_MS: u32 = 300;
 const FADE_MS: u32 = 300;
 /// 动画 tick 间隔
 const TICK_MS: u32 = 16;
-/// 显示期间的整窗透明度(255 = 不透明)
-const BASE_ALPHA: u8 = 235;
-/// 色键(品红)= 完全透明;COLORREF 布局为 0x00BBGGRR
-const COLOR_KEY: COLORREF = COLORREF(0x00FF_00FF);
-/// 胶囊底色(近白)
-const PILL_COLOR: COLORREF = COLORREF(0x00FA_FA_FA);
 
 // ---- 计时器 ID ----
 const TIMER_READ: usize = 1;
 const TIMER_ANIM: usize = 2;
 
-/// 自定义消息:请求显示语言浮层
-const WM_APP_SHOW: u32 = WM_APP + 1;
+/// 自定义消息:切换 IME 模式并显示浮层(全部动作在浮层线程执行)
+const WM_APP_TOGGLE: u32 = WM_APP + 1;
+/// 自定义消息:显示大小写状态(Alt+CapsLock 后)
+const WM_APP_CAPS: u32 = WM_APP + 2;
 
 // ---- 线程共享状态 ----
 
 static OVERLAY_HWND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static OVERLAY_TID: AtomicU32 = AtomicU32::new(0);
-/// 动画起点(毫秒时钟,GetTickCount64);0 = 未在显示
+/// 动画起点(毫秒时钟);0 = 未在显示
 static ANIM_START: AtomicU64 = AtomicU64::new(0);
 static CUR_LANG: Mutex<LangDisplay> = Mutex::new(LANG_EN);
 
-// ---- 语言定义 ----
+// ---- 状态定义 ----
 
-/// COLORREF 参数顺序是 R,G,B,内部布局 0x00BBGGRR
-const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF(r | (g << 8) | (b << 16))
+/// ARGB:高 8 位 alpha(绘制时恒 0xFF,淡出时整体乘系数),低 24 位 RGB
+const fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
+    (a << 24) | (r << 16) | (g << 8) | b
 }
 
-struct LangDisplay {
-    label: &'static str,
-    color: COLORREF,
+const fn hex(rgb: u32) -> u32 {
+    // "#RRGGBB" → GDI+ 的 ARGB 字节序(R 高位)
+    ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
 }
 
-const LANG_EN: LangDisplay = LangDisplay {
-    label: "EN",
-    color: rgb(0x1E, 0x70, 0xEB), // 蓝
+pub struct LangDisplay {
+    pub label: &'static str,
+    /// 胶囊底色(用户给的 hex)
+    pub bg: u32,
+    /// 文字颜色
+    pub fg: u32,
+}
+
+pub const LANG_EN: LangDisplay = LangDisplay {
+    label: "En",
+    bg: hex(0x0073FF),
+    fg: hex(0xF7F8FA),
 };
-const LANG_ZH: LangDisplay = LangDisplay {
+pub const LANG_ZH: LangDisplay = LangDisplay {
     label: "中",
-    color: rgb(0xE5, 0x39, 0x35), // 红
+    bg: hex(0xFF1F45),
+    fg: hex(0xF7F8FA),
 };
-const LANG_JA: LangDisplay = LangDisplay {
-    label: "日",
-    color: rgb(0xD4, 0x8E, 0x00), // 黄(加深以保证白底可读)
+pub const LANG_JA: LangDisplay = LangDisplay {
+    label: "あ",
+    bg: hex(0xFFBF00),
+    fg: hex(0x212527),
 };
-const LANG_KO: LangDisplay = LangDisplay {
-    label: "韩",
-    color: rgb(0x21, 0x21, 0x21), // 黑
+pub const LANG_KO: LangDisplay = LangDisplay {
+    label: "한",
+    bg: hex(0x212527),
+    fg: hex(0xF7F8FA),
+};
+pub const LANG_CAPS_ON: LangDisplay = LangDisplay {
+    label: "大写",
+    bg: hex(0x510068),
+    fg: hex(0xF7F8FA),
+};
+pub const LANG_CAPS_OFF: LangDisplay = LangDisplay {
+    label: "小写",
+    bg: hex(0xD746FF),
+    fg: hex(0xF7F8FA),
 };
 
 // ---- 对外接口 ----
@@ -116,11 +128,20 @@ pub fn spawn_thread() {
     std::thread::spawn(|| unsafe { message_loop() });
 }
 
-/// 请求显示语言浮层。可在钩子线程调用:仅投递一条消息,立即返回。
+/// 请求切换 IME 模式并显示浮层。可在钩子线程调用:仅投递一条消息,立即返回。
+/// 切换(含 AttachThreadInput/SendMessageTimeout 等阻塞调用)在浮层线程执行,
+/// 低级钩子回调里绝不能跑这些——超时会被系统静默摘除钩子。
 pub fn show_language_overlay() {
+    post_show(WM_APP_TOGGLE);
+}
+
+/// 请求显示大小写浮层(Alt+CapsLock 切换后)。
+/// `caps_on`:当前是否处于大写锁定。
+pub fn show_caps_overlay(caps_on: bool) {
+    let lparam = if caps_on { LPARAM(1) } else { LPARAM(0) };
     let p = OVERLAY_HWND.load(Ordering::SeqCst);
     if !p.is_null() {
-        let _ = unsafe { PostMessageW(Some(HWND(p)), WM_APP_SHOW, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(HWND(p)), WM_APP_CAPS, WPARAM(0), lparam) };
     }
 }
 
@@ -132,14 +153,22 @@ pub fn post_quit() {
     }
 }
 
+fn post_show(msg: u32) {
+    let p = OVERLAY_HWND.load(Ordering::SeqCst);
+    if !p.is_null() {
+        let _ = unsafe { PostMessageW(Some(HWND(p)), msg, WPARAM(0), LPARAM(0)) };
+    }
+}
+
 // ---- 浮层线程 ----
 
 unsafe fn message_loop() {
     OVERLAY_TID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
 
+    unsafe { gdiplus_init() };
+
     let hinst = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW 失败");
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinst.into(),
         lpszClassName: w!("CapsLockOverlayWnd"),
@@ -167,11 +196,6 @@ unsafe fn message_loop() {
     }
     .expect("创建浮层窗口失败");
 
-    // 色键 + 整窗透明度;品红像素完全透明,其余按 alpha 混合
-    unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, BASE_ALPHA, LWA_COLORKEY | LWA_ALPHA);
-    }
-
     OVERLAY_HWND.store(hwnd.0, Ordering::SeqCst);
 
     let mut msg = MSG::default();
@@ -191,16 +215,22 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     unsafe {
         match msg {
-            WM_APP_SHOW => {
+            WM_APP_TOGGLE => {
+                // 先切(两级 API,失败回退 Ctrl+Space 注入),再延时检测显示。
+                // 阻塞调用全在本线程执行——低级钩子回调里跑会超时摘钩。
+                println!("[overlay] 收到切换请求");
+                ime_toggle::toggle_or_fallback();
                 on_request_show(hwnd);
+                LRESULT(0)
+            }
+            WM_APP_CAPS => {
+                let caps_on = lparam.0 != 0;
+                let lang = if caps_on { LANG_CAPS_ON } else { LANG_CAPS_OFF };
+                on_request_show_with(hwnd, lang);
                 LRESULT(0)
             }
             WM_TIMER => {
                 on_timer(hwnd, wparam.0);
-                LRESULT(0)
-            }
-            WM_PAINT => {
-                on_paint(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -212,45 +242,39 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// 收到显示请求:重置状态,延时一小段再读输入法(等 IME 落定)
+/// 收到显示请求:延时一小段再检测显示(等 IME 落定)
 unsafe fn on_request_show(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER_READ);
         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-        // 恢复不透明(若上次停在淡出中途)
-        let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, BASE_ALPHA, LWA_COLORKEY | LWA_ALPHA);
         let _ = SetTimer(Some(hwnd), TIMER_READ, READ_DELAY_MS, None);
     }
 }
 
-/// 单个动画 tick:按「从显示起经过的绝对时间」直接算 alpha,不依赖链式计时器。
-/// t < SHOW_MS        -> BASE_ALPHA
-/// SHOW_MS..=SHOW+FADE -> 线性淡到 0
-/// 之后               -> 强制隐藏
+/// 收到显示请求(内容已定,无需检测):直接显示
+unsafe fn on_request_show_with(hwnd: HWND, lang: LangDisplay) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_READ);
+        let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+        *CUR_LANG.lock().unwrap() = lang;
+        layout_window(hwnd);
+        render_frame(hwnd, 255);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ANIM_START.store(GetTickCount64(), Ordering::SeqCst);
+        let _ = SetTimer(Some(hwnd), TIMER_ANIM, TICK_MS, None);
+    }
+}
+
 unsafe fn on_timer(hwnd: HWND, id: usize) {
     unsafe {
         match id {
             TIMER_READ => {
-                // 读取当前输入语言,测量居中并显示,启动动画
                 let _ = KillTimer(Some(hwnd), TIMER_READ);
-                *CUR_LANG.lock().unwrap() = detect_language();
+                // 重新检测一次(等 IME 落定后的真实状态)再上屏
+                *CUR_LANG.lock().unwrap() = ime_toggle::detect_current_display();
                 layout_window(hwnd);
+                render_frame(hwnd, 255);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-                let _ = SetLayeredWindowAttributes(
-                    hwnd,
-                    COLOR_KEY,
-                    BASE_ALPHA,
-                    LWA_COLORKEY | LWA_ALPHA,
-                );
                 ANIM_START.store(GetTickCount64(), Ordering::SeqCst);
                 let _ = SetTimer(Some(hwnd), TIMER_ANIM, TICK_MS, None);
             }
@@ -261,27 +285,19 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
                 }
                 let elapsed = (GetTickCount64() - start) as u32;
                 let alpha = if elapsed < SHOW_MS {
-                    BASE_ALPHA
+                    255
                 } else if elapsed < SHOW_MS + FADE_MS {
                     let t = elapsed - SHOW_MS;
-                    // 线性淡出(整除);到时后的下一 tick 由下面的超时分支强制归零
-                    BASE_ALPHA.saturating_sub((BASE_ALPHA as u32 * t / FADE_MS) as u8)
+                    (255u32 * (FADE_MS - t) / FADE_MS) as u8
                 } else {
                     0
                 };
                 if alpha == 0 {
-                    // 动画结束:停表、强制完全透明、隐藏窗口
                     ANIM_START.store(0, Ordering::SeqCst);
                     let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-                    let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, 0, LWA_COLORKEY | LWA_ALPHA);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 } else {
-                    let _ = SetLayeredWindowAttributes(
-                        hwnd,
-                        COLOR_KEY,
-                        alpha,
-                        LWA_COLORKEY | LWA_ALPHA,
-                    );
+                    render_frame(hwnd, alpha);
                 }
             }
             _ => {}
@@ -289,245 +305,288 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
     }
 }
 
-/// 按当前文字测量尺寸并把窗口移到屏幕正中。
-/// 尺寸变化后必须整窗失效:分层窗口复用旧位图,不失效的话
-/// 旧内容的边缘会残留(表现为胶囊两侧像被切掉一条)。
-unsafe fn layout_window(hwnd: HWND) {
-    let label = CUR_LANG.lock().unwrap().label;
-    let (tw, th) = unsafe { measure_text(hwnd, label) };
-    let width = tw + PAD_X * 2;
-    let height = th + PAD_Y * 2;
-    let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+// ---- 渲染(GDI+ → 预乘 ARGB DIB → UpdateLayeredWindow) ----
+
+/// 每帧重绘:胶囊底 + 文字,整体乘 alpha 后经 ULW 提交。
+/// 注意:先取出 (label,bg,fg) 再放锁,内部不再触碰 CUR_LANG,
+/// 否则 current_size() 二次加锁会自死锁(浮层线程直接冻住)。
+unsafe fn render_frame(hwnd: HWND, alpha: u8) {
     unsafe {
-        let _ = MoveWindow(
-            hwnd,
-            (sw - width) / 2,
-            (sh - height) / 2,
-            width,
-            height,
-            false,
-        );
-        // NULL = 整个客户区失效,强制下次完整重绘
-        let _ = InvalidateRect(Some(hwnd), None, false);
-        let _ = UpdateWindow(hwnd);
+        let (label, bg_rgb, fg_rgb, w, h) = {
+            let lang = CUR_LANG.lock().unwrap();
+            let (w, h) = measure_cached(lang.label);
+            (lang.label, lang.bg, lang.fg, w, h)
+        };
+        let bg = argb(alpha as u32, (bg_rgb >> 16) & 0xFF, (bg_rgb >> 8) & 0xFF, bg_rgb & 0xFF);
+        let fg = argb(alpha as u32, (fg_rgb >> 16) & 0xFF, (fg_rgb >> 8) & 0xFF, fg_rgb & 0xFF);
+        draw_pill(hwnd, w, h, bg, fg, label);
     }
 }
 
-unsafe fn on_paint(hwnd: HWND) {
+/// 已启动的 GDI+ token(进程级,浮层线程内使用)
+static mut GDIPLUS_TOKEN: usize = 0;
+
+unsafe fn gdiplus_init() {
     unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let rc: RECT = ps.rcPaint;
+        let input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let mut token: usize = 0;
+        let st = GdiplusStartup(&mut token, &input, std::ptr::null_mut());
+        debug_assert!(st == Status(0), "GdiplusStartup 失败: {st:?}");
+        GDIPLUS_TOKEN = token;
+    }
+}
 
-        // 1. 整面填色键(品红)= 完全透明
-        let key_brush = CreateSolidBrush(COLOR_KEY);
-        FillRect(hdc, &rc, key_brush);
-        let _ = DeleteObject(key_brush.into());
+/// 在 32bpp DIB 上用 GDI+ 绘制圆角胶囊 + 居中文字,经 ULW 提交。
+unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
+    unsafe {
+        // 1. 建 32-bit DIB(预乘 ARGB)
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            .expect("CreateDIBSection 失败");
+        // 全零 = 全透明起点
+        std::ptr::write_bytes(bits as *mut u8, 0, (w * h * 4) as usize);
 
-        // 2. 近白色胶囊底(NULL_PEN 避免描边)
-        let pill = CreateSolidBrush(PILL_COLOR);
-        let old_brush = SelectObject(hdc, pill.into());
-        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        let r = (rc.bottom - rc.top) / 2;
-        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
-        let _ = SelectObject(hdc, old_pen);
-        let _ = SelectObject(hdc, old_brush);
-        let _ = DeleteObject(pill.into());
+        let hdc = CreateCompatibleDC(None);
+        let old = SelectObject(hdc, hbmp.into());
 
-        // 3. 居中绘制语言文字
-        {
-            let lang = CUR_LANG.lock().unwrap();
-            let font = create_font();
-            let old_font = SelectObject(hdc, font.into());
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, lang.color);
-            let wide: Vec<u16> = lang.label.encode_utf16().collect();
-            let (tw, th) = text_size(hdc, &wide);
-            let x = rc.left + ((rc.right - rc.left) - tw) / 2;
-            let y = rc.top + ((rc.bottom - rc.top) - th) / 2;
-            let _ = TextOutW(hdc, x, y, &wide);
-            let _ = SelectObject(hdc, old_font);
-            let _ = DeleteObject(font.into());
+        // 2. GDI+ 绘制 —— 关键:scan0 必须指向 DIB 的内存,
+        //    否则 GDI+ 画进自己的内部缓冲,DIB 保持全零(全透明),
+        //    ULW 提交的就是一张看不见的空图。
+        let mut bitmap = std::ptr::null_mut();
+        let st = GdipCreateBitmapFromScan0(
+            w,
+            h,
+            w * 4,
+            0xE200B, /* PixelFormat32bppPARGB */
+            Some(bits as *const u8),
+            &mut bitmap as *mut _ as *mut *mut _,
+        );
+        if st != Status(0) {
+            eprintln!("[overlay] GdipCreateBitmapFromScan0 失败: {st:?}");
         }
 
-        let _ = EndPaint(hwnd, &mut ps);
+        let mut graphics = std::ptr::null_mut();
+        let _ = GdipGetImageGraphicsContext(bitmap as *mut _, &mut graphics);
+        let _ = GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+        let _ = GdipSetPixelOffsetMode(graphics, PixelOffsetModeHighQuality);
+        let _ = GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAlias);
+
+        // 胶囊底(圆角矩形路径)
+        let mut path = std::ptr::null_mut();
+        let _ = GdipCreatePath(FillModeAlternate, &mut path);
+        add_round_rect(path, 0.0, 0.0, w as f32, h as f32, RADIUS);
+        let mut brush = std::ptr::null_mut();
+        let _ = GdipCreateSolidFill(bg, &mut brush);
+        let _ = GdipFillPath(graphics, brush as *mut GpBrush, path);
+        let _ = GdipDeleteBrush(brush as *mut GpBrush);
+        let _ = GdipDeletePath(path);
+
+        // 居中文字
+        let mut family = std::ptr::null_mut();
+        let _ = GdipCreateFontFamilyFromName(
+            w!("Microsoft YaHei UI"),
+            std::ptr::null_mut(),
+            &mut family,
+        );
+        let mut font = std::ptr::null_mut();
+        let _ = GdipCreateFont(family, FONT_SIZE_PX, FontStyleBold.0, UnitPixel, &mut font);
+        let mut fmt = std::ptr::null_mut();
+        let _ = GdipCreateStringFormat(0, 0, &mut fmt);
+        let _ = GdipSetStringFormatAlign(fmt, StringAlignmentCenter);
+        let _ = GdipSetStringFormatLineAlign(fmt, StringAlignmentCenter);
+        let mut fg_brush = std::ptr::null_mut();
+        let _ = GdipCreateSolidFill(fg, &mut fg_brush);
+        let layout = RectF {
+            X: 0.0,
+            Y: 0.0,
+            Width: w as f32,
+            Height: h as f32,
+        };
+        let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = GdipDrawString(
+            graphics,
+            PCWSTR(text.as_ptr()),
+            -1,
+            font,
+            &layout,
+            fmt,
+            fg_brush as *mut GpBrush,
+        );
+        let _ = GdipDeleteBrush(fg_brush as *mut GpBrush);
+        let _ = GdipDeleteStringFormat(fmt);
+        let _ = GdipDeleteFont(font);
+        let _ = GdipDeleteFontFamily(family);
+        let _ = GdipDeleteGraphics(graphics);
+        let _ = GdipDisposeImage(bitmap as *mut _);
+
+        // 3. 位图已是预乘格式,直接 ULW 提交
+        let pt_src = POINT { x: 0, y: 0 };
+        let size = SIZE { cx: w, cy: h };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let pt_dst = window_pos(w, h);
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&pt_dst),
+            Some(&size),
+            Some(hdc),
+            Some(&pt_src),
+            Default::default(),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(hbmp.into());
     }
 }
 
-unsafe fn create_font() -> HFONT {
+/// 用四段圆弧拼圆角矩形路径
+unsafe fn add_round_rect(
+    path: *mut windows::Win32::Graphics::GdiPlus::GpPath,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+) {
     unsafe {
-        CreateFontW(
-            -FONT_SIZE_PX, // 高度为负 = 字号按像素计
-            0,
-            0,
-            0,
-            FW_SEMIBOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        let d = r * 2.0;
+        // 四个角:左上、右上、右下、左下(顺时针)
+        let _ = GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+        let _ = GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
+        let _ = GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
+        let _ = GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
+        let _ = GdipClosePathFigure(path);
+    }
+}
+
+/// 计算屏幕居中坐标
+fn window_pos(w: i32, h: i32) -> POINT {
+    unsafe {
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        POINT {
+            x: (sw - w) / 2,
+            y: (sh - h) / 2,
+        }
+    }
+}
+
+// ---- 尺寸测量(带缓存,避免每帧建 GDI+ 对象) ----
+
+static SIZE_CACHE: Mutex<Vec<(&'static str, i32, i32)>> = Mutex::new(Vec::new());
+
+fn measure_cached(label: &str) -> (i32, i32) {
+    // 标签集合极小(En/中/あ/한/大写/小写),直接线性查
+    let mut cache = SIZE_CACHE.lock().unwrap();
+    if let Some((_, w, h)) = cache.iter().find(|(l, _, _)| *l == label) {
+        return (*w, *h);
+    }
+    let (w, h) = unsafe { measure_gdiplus(label) };
+    cache.push((leak_label(label), w, h));
+    (w, h)
+}
+
+/// 测量结果缓存键必须是 'static;调用方传入的都来自 LangDisplay::label,
+/// 本身即 &'static str,leak 只是类型层面的安全转换。
+fn leak_label(label: &str) -> &'static str {
+    unsafe { std::mem::transmute::<&str, &'static str>(label) }
+}
+
+unsafe fn measure_gdiplus(label: &str) -> (i32, i32) {
+    unsafe {
+        let mut family = std::ptr::null_mut();
+        let _ = GdipCreateFontFamilyFromName(
             w!("Microsoft YaHei UI"),
+            std::ptr::null_mut(),
+            &mut family,
+        );
+        let mut font = std::ptr::null_mut();
+        let _ = GdipCreateFont(family, FONT_SIZE_PX, FontStyleBold.0, UnitPixel, &mut font);
+        let mut fmt = std::ptr::null_mut();
+        let _ = GdipCreateStringFormat(0, 0, &mut fmt);
+        let _ = GdipSetStringFormatAlign(fmt, StringAlignmentCenter);
+        let _ = GdipSetStringFormatLineAlign(fmt, StringAlignmentCenter);
+
+        // 给一个大布局矩形,让 GDI+ 报出自然尺寸
+        let big = RectF {
+            X: 0.0,
+            Y: 0.0,
+            Width: 1000.0,
+            Height: 200.0,
+        };
+        let mut bbox = RectF::default();
+        let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
+        // MeasureString 需要 graphics;用一个 1x1 内存位图的上下文即可
+        let mut bitmap = std::ptr::null_mut();
+        let _ =
+            GdipCreateBitmapFromScan0(1, 1, 4, 0xE200B, None, &mut bitmap as *mut _ as *mut *mut _);
+        let mut graphics = std::ptr::null_mut();
+        let _ = GdipGetImageGraphicsContext(bitmap as *mut _, &mut graphics);
+        let _ = GdipMeasureString(
+            graphics,
+            PCWSTR(text.as_ptr()),
+            -1,
+            font,
+            &big,
+            fmt,
+            &mut bbox,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let _ = GdipDeleteGraphics(graphics);
+        let _ = GdipDisposeImage(bitmap as *mut _);
+        let _ = GdipDeleteStringFormat(fmt);
+        let _ = GdipDeleteFont(font);
+        let _ = GdipDeleteFontFamily(family);
+        (
+            (bbox.Width.ceil() as i32) + PAD_X * 2,
+            (bbox.Height.ceil() as i32) + PAD_Y * 2,
         )
     }
 }
 
-unsafe fn measure_text(hwnd: HWND, text: &str) -> (i32, i32) {
+/// 按文字测量尺寸并设定窗口位置(尺寸不变则不动)
+unsafe fn layout_window(hwnd: HWND) {
     unsafe {
-        let hdc = GetDC(Some(hwnd));
-        let font = create_font();
-        let old = SelectObject(hdc, font.into());
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let size = text_size(hdc, &wide);
-        let _ = SelectObject(hdc, old);
-        let _ = DeleteObject(font.into());
-        let _ = ReleaseDC(Some(hwnd), hdc);
-        size
-    }
-}
-
-unsafe fn text_size(hdc: windows::Win32::Graphics::Gdi::HDC, wide: &[u16]) -> (i32, i32) {
-    let mut sz = SIZE::default();
-    if unsafe { GetTextExtentPoint32W(hdc, wide, &mut sz) }.as_bool() {
-        (sz.cx, sz.cy)
-    } else {
-        (0, 0)
-    }
-}
-
-// ---- 语言检测 ----
-
-fn detect_language() -> LangDisplay {
-    unsafe {
-        let fg = GetForegroundWindow();
-        if fg.0.is_null() {
-            return LANG_EN;
-        }
-
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        let hkl = GetKeyboardLayout(fg_tid);
-        // HKL 低 16 位是 LANGID,其低 10 位是主语言标识
-        let langid = (hkl.0 as usize) & 0xFFFF;
-        let primary = langid & 0x3FF;
-
-        let lang_name = match primary {
-            0x04 => "zh",
-            0x11 => "ja",
-            0x12 => "ko",
-            _ => "other",
+        let (w, h) = {
+            let lang = CUR_LANG.lock().unwrap();
+            measure_cached(lang.label)
         };
-
-        // 两级探测,任一级给出结果即用
-        let (open, native) = match probe_via_context(fg) {
-            Some(v) => {
-                println!("[detect] {lang_name}: ImmGetContext 层 open={} conv_native={}", v.0, v.1);
-                v
-            }
-            None => match probe_via_ime_wnd(fg) {
-                Some(v) => {
-                    println!("[detect] {lang_name}: WM_IME_CONTROL 层 open={} conv_native={}", v.0, v.1);
-                    v
-                }
-                None => {
-                    println!("[detect] {lang_name}: 两级探测均失败,按键盘布局回退");
-                    // 查不到模式,按布局显示语种(不误报 EN)
-                    return match primary {
-                        0x04 => LANG_ZH,
-                        0x11 => LANG_JA,
-                        0x12 => LANG_KO,
-                        _ => LANG_EN,
-                    };
-                }
-            },
-        };
-
-        match primary {
-            0x04 => {
-                // 中文输入法:开 + native(中文)模式 = 中;英文模式 = EN
-                if open && native {
-                    LANG_ZH
-                } else {
-                    LANG_EN
-                }
-            }
-            0x11 => {
-                // 日文输入法:开 + 假名(native)模式 = 日;直接入力/英数 = EN
-                if open && native {
-                    LANG_JA
-                } else {
-                    LANG_EN
-                }
-            }
-            0x12 => {
-                // 韩文输入法:转换模式的 native 位区分 한/A
-                if native {
-                    LANG_KO
-                } else {
-                    LANG_EN
-                }
-            }
-            _ => LANG_EN,
-        }
-    }
-}
-
-/// 第一级:AttachThreadInput 后 ImmGetContext 直接读前台输入上下文。
-/// Windows 8+ 的 HIMC 是进程私有的,跨进程常拿不到 → 返回 None 换下一级。
-unsafe fn probe_via_context(fg: HWND) -> Option<(bool, bool)> {
-    unsafe {
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        let my_tid = GetCurrentThreadId();
-        let attached = fg_tid != my_tid && AttachThreadInput(my_tid, fg_tid, true).as_bool();
-
-        let r = (|| {
-            let himc = ImmGetContext(fg);
-            if himc.is_invalid() {
-                return None;
-            }
-            let open = ImmGetOpenStatus(himc).as_bool();
-            let mut conv = IME_CONVERSION_MODE(0);
-            let got_conv = ImmGetConversionStatus(himc, Some(&mut conv), None).as_bool();
-            let native = got_conv && (conv.0 & IME_CMODE_NATIVE) != 0;
-            Some((open, native))
-        })();
-
-        if attached {
-            let _ = AttachThreadInput(my_tid, fg_tid, false);
-        }
-        r
-    }
-}
-
-/// 第二级:问前台默认 IME 窗口(AutoHotkey 的 IME 用户常用手法)。
-unsafe fn probe_via_ime_wnd(fg: HWND) -> Option<(bool, bool)> {
-    unsafe {
-        let ime = ImmGetDefaultIMEWnd(fg);
-        if ime.0.is_null() {
-            return None;
-        }
-        let open = query_ime_wnd(ime, IMC_GETOPENSTATUS)? != 0;
-        let conv = query_ime_wnd(ime, IMC_GETCONVERSIONMODE)?;
-        Some((open, (conv & IME_CMODE_NATIVE as usize) != 0))
-    }
-}
-
-/// 向 IME 窗口发查询,超时/失败返回 None
-unsafe fn query_ime_wnd(ime: HWND, imc: u32) -> Option<usize> {
-    unsafe {
-        let mut result: usize = 0;
-        let ok = SendMessageTimeoutW(
-            ime,
-            WM_IME_CONTROL,
-            WPARAM(imc as usize),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG,
-            100,
-            Some(&mut result),
+        let pos = window_pos(w, h);
+        // SetWindowPos 触发 ULW 尺寸变化;位置每次都重设(屏幕可能变了)
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            pos.x,
+            pos.y,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        if ok.0 == 0 { None } else { Some(result) }
     }
 }
+
+use windows::core::{PCWSTR, w};
