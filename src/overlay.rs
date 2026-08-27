@@ -2,7 +2,8 @@
 //!
 //! EN 蓝色 / 中 红色 / 日 黄色 / 韩 黑色,显示 0.3s 后再用 0.3s 淡出消失。
 //! 检测方式:前台窗口所在线程的键盘布局(HKL)定语种,
-//! 再用 WM_IME_CONTROL 查 IME 的开/关与转换模式区分「本国语言/英文」输入模式。
+//! 再经 AttachThreadInput 后用 ImmGetContext + ImmGetConversionStatus
+//! 读取前台输入上下文的真实转换状态,区分本国语言模式与英文模式。
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU32, Ordering};
@@ -11,13 +12,17 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WP
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BeginPaint, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, EndPaint, FF_DONTCARE, FW_SEMIBOLD, FillRect,
-    GetDC, GetStockObject, GetTextExtentPoint32W, HFONT, NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    GetDC, GetStockObject, GetTextExtentPoint32W, HFONT, InvalidateRect, NULL_PEN,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT, TextOutW, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
+use windows::Win32::UI::Input::Ime::{
+    ImmGetContext, ImmGetConversionStatus, ImmGetDefaultIMEWnd, ImmGetOpenStatus,
+    IME_CONVERSION_MODE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow,
@@ -31,13 +36,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
-// windows crate 未导出的 IME 消息常量(imm.h)
-/// 查询 IME 开启状态(中文/日文 IME 的「允许 native 输入」开关)
+// windows crate 未导出的 IME 常量(imm.h)
+/// 转换模式中的「本国语言输入」位:置位 = 中文/假名/韩文模式
+const IME_CMODE_NATIVE: u32 = 0x0001;
+/// WM_IME_CONTROL:查 IME 开启状态
 const IMC_GETOPENSTATUS: u32 = 0x0005;
-/// 查询当前转换模式(韩文 IME 用它的 native 位区分韩/英)
+/// WM_IME_CONTROL:查转换模式
 const IMC_GETCONVERSIONMODE: u32 = 0x0001;
-/// 转换模式中的「本国语言输入」位
-const IME_CMODE_NATIVE: usize = 0x0001;
 
 // ---- 可视参数 ----
 
@@ -46,7 +51,7 @@ const FONT_SIZE_PX: i32 = 24;
 const PAD_X: i32 = 20;
 const PAD_Y: i32 = 12;
 /// 注入 Ctrl+Space 后等待输入法状态落定的延时
-const READ_DELAY_MS: u32 = 120;
+const READ_DELAY_MS: u32 = 20;
 /// 完全显示的持续时间
 const SHOW_MS: u32 = 300;
 /// 淡出持续时间
@@ -284,7 +289,9 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
     }
 }
 
-/// 按当前文字测量尺寸并把窗口移到屏幕正中
+/// 按当前文字测量尺寸并把窗口移到屏幕正中。
+/// 尺寸变化后必须整窗失效:分层窗口复用旧位图,不失效的话
+/// 旧内容的边缘会残留(表现为胶囊两侧像被切掉一条)。
 unsafe fn layout_window(hwnd: HWND) {
     let label = CUR_LANG.lock().unwrap().label;
     let (tw, th) = unsafe { measure_text(hwnd, label) };
@@ -301,6 +308,9 @@ unsafe fn layout_window(hwnd: HWND) {
             height,
             false,
         );
+        // NULL = 整个客户区失效,强制下次完整重绘
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = UpdateWindow(hwnd);
     }
 }
 
@@ -398,32 +408,63 @@ fn detect_language() -> LangDisplay {
             return LANG_EN;
         }
 
-        let tid = GetWindowThreadProcessId(fg, None);
-        let hkl = GetKeyboardLayout(tid);
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let hkl = GetKeyboardLayout(fg_tid);
         // HKL 低 16 位是 LANGID,其低 10 位是主语言标识
         let langid = (hkl.0 as usize) & 0xFFFF;
         let primary = langid & 0x3FF;
 
+        let lang_name = match primary {
+            0x04 => "zh",
+            0x11 => "ja",
+            0x12 => "ko",
+            _ => "other",
+        };
+
+        // 两级探测,任一级给出结果即用
+        let (open, native) = match probe_via_context(fg) {
+            Some(v) => {
+                println!("[detect] {lang_name}: ImmGetContext 层 open={} conv_native={}", v.0, v.1);
+                v
+            }
+            None => match probe_via_ime_wnd(fg) {
+                Some(v) => {
+                    println!("[detect] {lang_name}: WM_IME_CONTROL 层 open={} conv_native={}", v.0, v.1);
+                    v
+                }
+                None => {
+                    println!("[detect] {lang_name}: 两级探测均失败,按键盘布局回退");
+                    // 查不到模式,按布局显示语种(不误报 EN)
+                    return match primary {
+                        0x04 => LANG_ZH,
+                        0x11 => LANG_JA,
+                        0x12 => LANG_KO,
+                        _ => LANG_EN,
+                    };
+                }
+            },
+        };
+
         match primary {
             0x04 => {
-                // 中文:IME 开 = 中文模式,关 = 英文模式
-                if ime_native_mode(fg, true) {
+                // 中文输入法:开 + native(中文)模式 = 中;英文模式 = EN
+                if open && native {
                     LANG_ZH
                 } else {
                     LANG_EN
                 }
             }
             0x11 => {
-                // 日文:IME 开 = 假名模式,关 = 直接输入(英文)
-                if ime_native_mode(fg, true) {
+                // 日文输入法:开 + 假名(native)模式 = 日;直接入力/英数 = EN
+                if open && native {
                     LANG_JA
                 } else {
                     LANG_EN
                 }
             }
             0x12 => {
-                // 韩文:看转换模式的 native 位(开/关状态对韩文 IME 不适用)
-                if ime_native_mode(fg, false) {
+                // 韩文输入法:转换模式的 native 位区分 한/A
+                if native {
                     LANG_KO
                 } else {
                     LANG_EN
@@ -434,20 +475,49 @@ fn detect_language() -> LangDisplay {
     }
 }
 
-/// 查询前台窗口 IME 是否处于「本国语言输入」模式。
-/// `open_based`:中文/日文用开/关状态;韩文用转换模式的 IME_CMODE_NATIVE 位。
-/// 查询失败时按本国语言处理(宁可显示 中/日/韩 也不误报 EN)。
-unsafe fn ime_native_mode(hwnd: HWND, open_based: bool) -> bool {
+/// 第一级:AttachThreadInput 后 ImmGetContext 直接读前台输入上下文。
+/// Windows 8+ 的 HIMC 是进程私有的,跨进程常拿不到 → 返回 None 换下一级。
+unsafe fn probe_via_context(fg: HWND) -> Option<(bool, bool)> {
     unsafe {
-        let ime = ImmGetDefaultIMEWnd(hwnd);
-        if ime.0.is_null() {
-            return true;
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let my_tid = GetCurrentThreadId();
+        let attached = fg_tid != my_tid && AttachThreadInput(my_tid, fg_tid, true).as_bool();
+
+        let r = (|| {
+            let himc = ImmGetContext(fg);
+            if himc.is_invalid() {
+                return None;
+            }
+            let open = ImmGetOpenStatus(himc).as_bool();
+            let mut conv = IME_CONVERSION_MODE(0);
+            let got_conv = ImmGetConversionStatus(himc, Some(&mut conv), None).as_bool();
+            let native = got_conv && (conv.0 & IME_CMODE_NATIVE) != 0;
+            Some((open, native))
+        })();
+
+        if attached {
+            let _ = AttachThreadInput(my_tid, fg_tid, false);
         }
-        let imc = if open_based {
-            IMC_GETOPENSTATUS
-        } else {
-            IMC_GETCONVERSIONMODE
-        };
+        r
+    }
+}
+
+/// 第二级:问前台默认 IME 窗口(AutoHotkey 的 IME 用户常用手法)。
+unsafe fn probe_via_ime_wnd(fg: HWND) -> Option<(bool, bool)> {
+    unsafe {
+        let ime = ImmGetDefaultIMEWnd(fg);
+        if ime.0.is_null() {
+            return None;
+        }
+        let open = query_ime_wnd(ime, IMC_GETOPENSTATUS)? != 0;
+        let conv = query_ime_wnd(ime, IMC_GETCONVERSIONMODE)?;
+        Some((open, (conv & IME_CMODE_NATIVE as usize) != 0))
+    }
+}
+
+/// 向 IME 窗口发查询,超时/失败返回 None
+unsafe fn query_ime_wnd(ime: HWND, imc: u32) -> Option<usize> {
+    unsafe {
         let mut result: usize = 0;
         let ok = SendMessageTimeoutW(
             ime,
@@ -455,16 +525,9 @@ unsafe fn ime_native_mode(hwnd: HWND, open_based: bool) -> bool {
             WPARAM(imc as usize),
             LPARAM(0),
             SMTO_ABORTIFHUNG,
-            80,
+            100,
             Some(&mut result),
         );
-        if ok.0 == 0 {
-            return true;
-        }
-        if open_based {
-            result != 0
-        } else {
-            (result & IME_CMODE_NATIVE) != 0
-        }
+        if ok.0 == 0 { None } else { Some(result) }
     }
 }
