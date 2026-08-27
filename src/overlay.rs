@@ -17,7 +17,7 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreatePath,
     GdipCreateSolidFill, GdipCreateStringFormat, GdipDeleteBrush, GdipDeleteFont,
     GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeleteStringFormat,
-    GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext, GdipMeasureString,
+    GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext,
     GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
     GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput,
     GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias, Status,
@@ -38,10 +38,12 @@ use crate::ime_toggle;
 
 // ---- 可视参数 ----
 
-/// 文字字号(像素)
-const FONT_SIZE_PX: f32 = 54.0;
-const PAD_X: i32 = 42;
-const PAD_Y: i32 = 20;
+/// 宽度 = 屏幕宽度的此比例
+const W_RATIO: f32 = 0.06;
+/// 高度 = 0.7 × 宽度
+const H_RATIO: f32 = 0.7;
+/// 文字高度 ≈ 此比例 × 胶囊高度
+const TEXT_H_RATIO: f32 = 0.66;
 /// 圆角半径
 const RADIUS: f32 = 16.0;
 /// 浮层中心相对屏幕中心的上移量(像素)
@@ -57,6 +59,25 @@ const SHOW_MS: u32 = 300;
 const FADE_MS: u32 = 300;
 /// 动画 tick 间隔
 const TICK_MS: u32 = 16;
+
+/// 全部尺寸度量:只由屏幕分辨率决定,任何机器上视觉比例一致。
+struct Metrics {
+    w: i32,
+    h: i32,
+    /// 文字 em 高度(像素)。GDI+ 字体的"高度"参数即 em size,
+    /// 中日韩字形 em 高≈字高,按 TEXT_H_RATIO × h 取值即可。
+    font_h: f32,
+}
+
+fn metrics() -> Metrics {
+    unsafe {
+        let sw = GetSystemMetrics(SM_CXSCREEN) as f32;
+        let w = (sw * W_RATIO).round() as i32;
+        let h = (w as f32 * H_RATIO).round() as i32;
+        let font_h = h as f32 * TEXT_H_RATIO;
+        Metrics { w, h, font_h }
+    }
+}
 
 // ---- 计时器 ID ----
 const TIMER_READ: usize = 1;
@@ -308,15 +329,13 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
 // ---- 渲染(GDI+ → 预乘 ARGB DIB → UpdateLayeredWindow) ----
 
 /// 每帧重绘:胶囊底 + 文字,整体乘 alpha 后经 ULW 提交。
-/// 注意:先取出 (label,bg,fg) 再放锁,内部不再触碰 CUR_LANG,
-/// 否则 current_size() 二次加锁会自死锁(浮层线程直接冻住)。
 unsafe fn render_frame(hwnd: HWND, alpha: u8) {
     unsafe {
-        let (label, bg_rgb, fg_rgb, w, h) = {
+        let (label, bg_rgb, fg_rgb) = {
             let lang = CUR_LANG.lock().unwrap();
-            let (w, h) = measure_cached(lang.label);
-            (lang.label, lang.bg, lang.fg, w, h)
+            (lang.label, lang.bg, lang.fg)
         };
+        let m = metrics();
         let bg = argb(
             alpha as u32,
             (bg_rgb >> 16) & 0xFF,
@@ -329,7 +348,7 @@ unsafe fn render_frame(hwnd: HWND, alpha: u8) {
             (fg_rgb >> 8) & 0xFF,
             fg_rgb & 0xFF,
         );
-        draw_pill(hwnd, w, h, bg, fg, label);
+        draw_pill(hwnd, m.w, m.h, m.font_h, bg, fg, label);
     }
 }
 
@@ -352,7 +371,7 @@ unsafe fn gdiplus_init() {
 /// 在 32bpp DIB 上用 GDI+ 绘制圆角胶囊 + 居中文字,经 ULW 提交。
 /// 内部按 SSAA 倍超采样绘制,再高质量缩到目标尺寸——
 /// 圆角和文字边缘比 1x 直接抗锯齿更细腻。
-unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
+unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, font_h: f32, bg: u32, fg: u32, label: &str) {
     unsafe {
         let big_w = w * SSAA;
         let big_h = h * SSAA;
@@ -424,7 +443,7 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
         let mut font = std::ptr::null_mut();
         let _ = GdipCreateFont(
             family,
-            FONT_SIZE_PX * SSAA as f32,
+            font_h * SSAA as f32,
             FontStyleBold.0,
             UnitPixel,
             &mut font,
@@ -571,96 +590,19 @@ fn window_pos(w: i32, h: i32) -> POINT {
     }
 }
 
-// ---- 尺寸测量(带缓存,避免每帧建 GDI+ 对象) ----
-
-static SIZE_CACHE: Mutex<Vec<(&'static str, i32, i32)>> = Mutex::new(Vec::new());
-
-fn measure_cached(label: &str) -> (i32, i32) {
-    // 标签集合极小(En/中/あ/한/大写/小写),直接线性查
-    let mut cache = SIZE_CACHE.lock().unwrap();
-    if let Some((_, w, h)) = cache.iter().find(|(l, _, _)| *l == label) {
-        return (*w, *h);
-    }
-    let (w, h) = unsafe { measure_gdiplus(label) };
-    cache.push((leak_label(label), w, h));
-    (w, h)
-}
-
-/// 测量结果缓存键必须是 'static;调用方传入的都来自 LangDisplay::label,
-/// 本身即 &'static str,leak 只是类型层面的安全转换。
-fn leak_label(label: &str) -> &'static str {
-    unsafe { std::mem::transmute::<&str, &'static str>(label) }
-}
-
-unsafe fn measure_gdiplus(label: &str) -> (i32, i32) {
-    unsafe {
-        let mut family = std::ptr::null_mut();
-        let _ = GdipCreateFontFamilyFromName(
-            w!("Microsoft YaHei UI"),
-            std::ptr::null_mut(),
-            &mut family,
-        );
-        let mut font = std::ptr::null_mut();
-        let _ = GdipCreateFont(family, FONT_SIZE_PX, FontStyleBold.0, UnitPixel, &mut font);
-        let mut fmt = std::ptr::null_mut();
-        let _ = GdipCreateStringFormat(0, 0, &mut fmt);
-        let _ = GdipSetStringFormatAlign(fmt, StringAlignmentCenter);
-        let _ = GdipSetStringFormatLineAlign(fmt, StringAlignmentCenter);
-
-        // 给一个大布局矩形,让 GDI+ 报出自然尺寸
-        let big = RectF {
-            X: 0.0,
-            Y: 0.0,
-            Width: 1000.0,
-            Height: 200.0,
-        };
-        let mut bbox = RectF::default();
-        let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-        // MeasureString 需要 graphics;用一个 1x1 内存位图的上下文即可
-        let mut bitmap = std::ptr::null_mut();
-        let _ =
-            GdipCreateBitmapFromScan0(1, 1, 4, 0xE200B, None, &mut bitmap as *mut _ as *mut *mut _);
-        let mut graphics = std::ptr::null_mut();
-        let _ = GdipGetImageGraphicsContext(bitmap as *mut _, &mut graphics);
-        let _ = GdipMeasureString(
-            graphics,
-            PCWSTR(text.as_ptr()),
-            -1,
-            font,
-            &big,
-            fmt,
-            &mut bbox,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        let _ = GdipDeleteGraphics(graphics);
-        let _ = GdipDisposeImage(bitmap as *mut _);
-        let _ = GdipDeleteStringFormat(fmt);
-        let _ = GdipDeleteFont(font);
-        let _ = GdipDeleteFontFamily(family);
-        (
-            (bbox.Width.ceil() as i32) + PAD_X * 2,
-            (bbox.Height.ceil() as i32) + PAD_Y * 2,
-        )
-    }
-}
-
-/// 按文字测量尺寸并设定窗口位置(尺寸不变则不动)
+/// 设定窗口位置与尺寸(尺寸由屏幕比例决定,与文字内容无关)
 unsafe fn layout_window(hwnd: HWND) {
     unsafe {
-        let (w, h) = {
-            let lang = CUR_LANG.lock().unwrap();
-            measure_cached(lang.label)
-        };
-        let pos = window_pos(w, h);
+        let m = metrics();
+        let pos = window_pos(m.w, m.h);
         // SetWindowPos 触发 ULW 尺寸变化;位置每次都重设(屏幕可能变了)
         let _ = SetWindowPos(
             hwnd,
             None,
             pos.x,
             pos.y,
-            w,
-            h,
+            m.w,
+            m.h,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
