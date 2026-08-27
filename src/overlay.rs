@@ -43,7 +43,7 @@ const W_RATIO: f32 = 0.06;
 /// 高度 = 0.7 × 宽度
 const H_RATIO: f32 = 0.7;
 /// 文字高度 ≈ 此比例 × 胶囊高度
-const TEXT_H_RATIO: f32 = 0.66;
+const TEXT_H_RATIO: f32 = 0.48;
 /// 圆角半径
 const RADIUS: f32 = 16.0;
 /// 浮层中心相对屏幕中心的上移量(像素)
@@ -98,6 +98,13 @@ static CUR_LANG: Mutex<LangDisplay> = Mutex::new(LANG_EN);
 
 // ---- 状态定义 ----
 
+/// 32-bit 颜色单通道掩码
+const COLOR_CHANNEL_MASK: u32 = 0xFF;
+/// GDI+ PixelFormat32bppPARGB(预乘 ARGB;crate 未导出此常量)
+const PIXEL_FORMAT_32BPP_PARGB: i32 = 0xE200B;
+/// GDI+ Status::Ok
+const GDIP_OK: Status = Status(0);
+
 /// ARGB:高 8 位 alpha(绘制时恒 0xFF,淡出时整体乘系数),低 24 位 RGB
 const fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
@@ -118,7 +125,7 @@ pub struct LangDisplay {
 }
 
 pub const LANG_EN: LangDisplay = LangDisplay {
-    label: "En",
+    label: "英",
     bg: hex(0x0073FF),
     fg: hex(0xF7F8FA),
 };
@@ -338,15 +345,15 @@ unsafe fn render_frame(hwnd: HWND, alpha: u8) {
         let m = metrics();
         let bg = argb(
             alpha as u32,
-            (bg_rgb >> 16) & 0xFF,
-            (bg_rgb >> 8) & 0xFF,
-            bg_rgb & 0xFF,
+            (bg_rgb >> 16) & COLOR_CHANNEL_MASK,
+            (bg_rgb >> 8) & COLOR_CHANNEL_MASK,
+            bg_rgb & COLOR_CHANNEL_MASK,
         );
         let fg = argb(
             alpha as u32,
-            (fg_rgb >> 16) & 0xFF,
-            (fg_rgb >> 8) & 0xFF,
-            fg_rgb & 0xFF,
+            (fg_rgb >> 16) & COLOR_CHANNEL_MASK,
+            (fg_rgb >> 8) & COLOR_CHANNEL_MASK,
+            fg_rgb & COLOR_CHANNEL_MASK,
         );
         draw_pill(hwnd, m.w, m.h, m.font_h, bg, fg, label);
     }
@@ -363,7 +370,7 @@ unsafe fn gdiplus_init() {
         };
         let mut token: usize = 0;
         let st = GdiplusStartup(&mut token, &input, std::ptr::null_mut());
-        debug_assert!(st == Status(0), "GdiplusStartup 失败: {st:?}");
+        debug_assert!(st == GDIP_OK, "GdiplusStartup 失败: {st:?}");
         GDIPLUS_TOKEN = token;
     }
 }
@@ -402,11 +409,11 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, font_h: f32, bg: u32, fg: u32, l
             big_w,
             big_h,
             big_w * 4,
-            0xE200B, /* PixelFormat32bppPARGB */
+            PIXEL_FORMAT_32BPP_PARGB,
             Some(src_bits.as_ptr()),
             &mut bitmap as *mut _ as *mut *mut _,
         );
-        if st != Status(0) {
+        if st != GDIP_OK {
             eprintln!("[overlay] GdipCreateBitmapFromScan0 失败: {st:?}");
         }
 
@@ -529,29 +536,35 @@ unsafe fn downsample_parbg(
     h: i32,
     factor: i32,
 ) {
+    // BGRA 小端字节序中的通道位移(B=0,G=8,R=16,A=24)
+    const SHIFT_B: u32 = 0;
+    const SHIFT_G: u32 = 8;
+    const SHIFT_R: u32 = 16;
+    const SHIFT_A: u32 = 24;
+
     unsafe {
         let f = factor as usize;
         for y in 0..h as usize {
             for x in 0..w as usize {
-                let mut bgra = [0u32; 4];
+                let mut acc = [0u32; 4]; // 累加 [B, G, R, A]
                 for dy in 0..f {
                     for dx in 0..f {
                         let sx = x * f + dx;
                         let sy = y * f + dy;
                         let s = src.offset((sy * big_w as usize + sx) as isize * 4) as *const u32;
                         let p = *s;
-                        bgra[0] += p & 0xFF;
-                        bgra[1] += (p >> 8) & 0xFF;
-                        bgra[2] += (p >> 16) & 0xFF;
-                        bgra[3] += (p >> 24) & 0xFF;
+                        acc[0] += (p >> SHIFT_B) & COLOR_CHANNEL_MASK;
+                        acc[1] += (p >> SHIFT_G) & COLOR_CHANNEL_MASK;
+                        acc[2] += (p >> SHIFT_R) & COLOR_CHANNEL_MASK;
+                        acc[3] += (p >> SHIFT_A) & COLOR_CHANNEL_MASK;
                     }
                 }
                 let n = (f * f) as u32;
                 let d = dst.offset((y * w as usize + x) as isize * 4) as *mut u32;
-                *d = (bgra[0] / n)
-                    | ((bgra[1] / n) << 8)
-                    | ((bgra[2] / n) << 16)
-                    | ((bgra[3] / n) << 24);
+                *d = ((acc[0] / n) << SHIFT_B)
+                    | ((acc[1] / n) << SHIFT_G)
+                    | ((acc[2] / n) << SHIFT_R)
+                    | ((acc[3] / n) << SHIFT_A);
             }
         }
     }

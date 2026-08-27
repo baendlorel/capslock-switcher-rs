@@ -22,10 +22,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::overlay::{LangDisplay, LANG_EN, LANG_JA, LANG_KO, LANG_ZH};
 
-/// WM_IME_CONTROL:查转换模式(翻转前先读当前值)
+// ---- IME 消息常量(windows crate 未导出,源自 imm.h) ----
+
+/// WM_IME_CONTROL:查转换模式(其中的 native 位区分「中/英」「かな/英」等)
 const IMC_GETCONVERSIONMODE: u32 = 0x0001;
+/// WM_IME_CONTROL:查 IME 开启状态
+const IMC_GETOPENSTATUS: u32 = 0x0005;
 /// 转换模式的「本国语言输入」位(= IME_CMODE_CHINESE = IME_CMODE_HANGUL)
 const IME_CMODE_NATIVE: u32 = 0x0001;
+/// 向 IME 窗口查询的超时毫秒数;超时视为该通道不可用
+const IME_QUERY_TIMEOUT_MS: u32 = 100;
+
+// ---- LANGID 解析(Win32 键盘布局的语言标识) ----
+
+/// HKL(loword)是 LANGID;LANGID 低 10 位是主语言,高 6 位是子语言
+const LANGID_MASK: usize = 0xFFFF;
+const PRIMARY_LANG_MASK: usize = 0x3FF;
+
+/// 主语言标识(Windows Language ID 的低 10 位)
+mod primary_lang {
+    /// 中文(zh)
+    pub const CHINESE: usize = 0x04;
+    /// 日文(ja)
+    pub const JAPANESE: usize = 0x11;
+    /// 韩文(ko)
+    pub const KOREAN: usize = 0x12;
+}
 
 /// 标记我们用 SendInput 注入的按键,避免钩子再次拦截造成死循环。
 pub(crate) const INJECTED_FLAG: usize = 0x1;
@@ -50,7 +72,7 @@ unsafe fn query(ime: HWND, imc: u32) -> Option<usize> {
             WPARAM(imc as usize),
             LPARAM(0),
             SMTO_ABORTIFHUNG,
-            100,
+            IME_QUERY_TIMEOUT_MS,
             Some(&mut result),
         );
         if ok.0 == 0 { None } else { Some(result) }
@@ -69,18 +91,18 @@ pub fn detect_current_display() -> LangDisplay {
 
         let fg_tid = GetWindowThreadProcessId(fg, None);
         let hkl = GetKeyboardLayout(fg_tid);
-        let primary = ((hkl.0 as usize) & 0xFFFF) & 0x3FF;
+        let primary = (hkl.0 as usize & LANGID_MASK) & PRIMARY_LANG_MASK;
 
         let (open, native) = probe_state(fg);
 
         match primary {
-            0x04 => {
+            primary_lang::CHINESE => {
                 if open && native { LANG_ZH } else { LANG_EN }
             }
-            0x11 => {
+            primary_lang::JAPANESE => {
                 if open && native { LANG_JA } else { LANG_EN }
             }
-            0x12 => {
+            primary_lang::KOREAN => {
                 if native { LANG_KO } else { LANG_EN }
             }
             _ => LANG_EN,
@@ -137,8 +159,7 @@ unsafe fn probe_ime_wnd_read(fg: HWND) -> Option<(bool, bool)> {
         if ime.0.is_null() {
             return None;
         }
-        // IMC_GETOPENSTATUS = 0x0005
-        let open = query(ime, 0x0005)? != 0;
+        let open = query(ime, IMC_GETOPENSTATUS)? != 0;
         let conv = query(ime, IMC_GETCONVERSIONMODE)?;
         Some((open, (conv & IME_CMODE_NATIVE as usize) != 0))
     }

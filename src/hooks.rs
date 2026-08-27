@@ -21,6 +21,9 @@ use crate::overlay;
 // 标记注入按键的 dwExtraInfo(注入逻辑在 ime_toggle,此处仅识别)
 use crate::ime_toggle::INJECTED_FLAG;
 
+/// GetKeyState 返回值的最低位 = toggle 状态(CapsLock 灯亮/灭)
+const KEYSTATE_TOGGLED: i16 = 0x0001;
+
 /// 缓存 Alt 键状态:0 = 松开,非 0 = 按下。
 /// 用 GetAsyncKeyState 轮询在低级钩子里不可靠,直接在钩子回调里跟踪。
 static ALT_DOWN: AtomicI16 = AtomicI16::new(0);
@@ -84,7 +87,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             // Alt+CapsLock:透传给系统切换大小写;松开时 CapsLock 状态已翻转,
             // 那时读 GetKeyState 才是切换后的新状态,所以浮层放在松开事件里显示。
             if is_up {
-                let caps_on = GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0;
+                let caps_on = GetKeyState(VK_CAPITAL.0 as i32) & KEYSTATE_TOGGLED != 0;
                 overlay::show_caps_overlay(caps_on);
             }
             CallNextHookEx(None, code, wparam, lparam)
@@ -92,7 +95,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             // CapsLock:吞掉,向浮层线程投递「切换 + 显示」请求。
             // 切换动作(AttachThreadInput/SendMessageTimeout/SendInput)都是阻塞调用,
             // 绝不能在低级钩子回调里执行——超时几次后系统会静默摘除钩子。
-            println!("[hook] CapsLock 按下,投递切换请求");
             overlay::show_language_overlay();
             LRESULT(1) // 非零返回值 = 吞掉该按键,不传递给系统
         }
