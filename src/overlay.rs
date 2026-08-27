@@ -125,7 +125,7 @@ pub struct LangDisplay {
 }
 
 pub const LANG_EN: LangDisplay = LangDisplay {
-    label: "英",
+    label: "En",
     bg: hex(0x0073FF),
     fg: hex(0xF7F8FA),
 };
@@ -145,12 +145,12 @@ pub const LANG_KO: LangDisplay = LangDisplay {
     fg: hex(0xF7F8FA),
 };
 pub const LANG_CAPS_ON: LangDisplay = LangDisplay {
-    label: "大写",
+    label: "AA",
     bg: hex(0x510068),
     fg: hex(0xF7F8FA),
 };
 pub const LANG_CAPS_OFF: LangDisplay = LangDisplay {
-    label: "小写",
+    label: "aa",
     bg: hex(0xD746FF),
     fg: hex(0xF7F8FA),
 };
