@@ -39,13 +39,18 @@ use crate::ime_toggle;
 // ---- 可视参数 ----
 
 /// 文字字号(像素)
-const FONT_SIZE_PX: f32 = 24.0;
-const PAD_X: i32 = 22;
-const PAD_Y: i32 = 12;
+const FONT_SIZE_PX: f32 = 54.0;
+const PAD_X: i32 = 45;
+const PAD_Y: i32 = 24;
 /// 圆角半径
-const RADIUS: f32 = 14.0;
+const RADIUS: f32 = 38.0;
+/// 浮层中心相对屏幕中心的上移量(像素)
+const LIFT_UP_PX: i32 = 120;
+/// 超采样倍数:按 2x 尺寸绘制,提交前高质量下采样到 1x,
+/// 边缘比单纯抗锯齿更细腻(2560x1440@100% 也看不出颗粒)。
+const SSAA: i32 = 2;
 /// 切换后等待输入法状态落定的延时
-const READ_DELAY_MS: u32 = 20;
+const READ_DELAY_MS: u32 = 10;
 /// 完全显示的持续时间
 const SHOW_MS: u32 = 300;
 /// 淡出持续时间
@@ -77,9 +82,10 @@ const fn argb(a: u32, r: u32, g: u32, b: u32) -> u32 {
     (a << 24) | (r << 16) | (g << 8) | b
 }
 
+/// "#RRGGBB" 数值字面量与 GDI+ ARGB 的 RGB 位序完全一致(R 在高位),
+/// 直接使用即可——任何字节交换都会把 R/B 弄反。
 const fn hex(rgb: u32) -> u32 {
-    // "#RRGGBB" → GDI+ 的 ARGB 字节序(R 高位)
-    ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
+    rgb
 }
 
 pub struct LangDisplay {
@@ -123,20 +129,14 @@ pub const LANG_CAPS_OFF: LangDisplay = LangDisplay {
 
 // ---- 对外接口 ----
 
-/// 启动浮层窗口线程(常驻,负责显示/淡出/隐藏)
 pub fn spawn_thread() {
     std::thread::spawn(|| unsafe { message_loop() });
 }
 
-/// 请求切换 IME 模式并显示浮层。可在钩子线程调用:仅投递一条消息,立即返回。
-/// 切换(含 AttachThreadInput/SendMessageTimeout 等阻塞调用)在浮层线程执行,
-/// 低级钩子回调里绝不能跑这些——超时会被系统静默摘除钩子。
 pub fn show_language_overlay() {
     post_show(WM_APP_TOGGLE);
 }
 
-/// 请求显示大小写浮层(Alt+CapsLock 切换后)。
-/// `caps_on`:当前是否处于大写锁定。
 pub fn show_caps_overlay(caps_on: bool) {
     let lparam = if caps_on { LPARAM(1) } else { LPARAM(0) };
     let p = OVERLAY_HWND.load(Ordering::SeqCst);
@@ -317,8 +317,18 @@ unsafe fn render_frame(hwnd: HWND, alpha: u8) {
             let (w, h) = measure_cached(lang.label);
             (lang.label, lang.bg, lang.fg, w, h)
         };
-        let bg = argb(alpha as u32, (bg_rgb >> 16) & 0xFF, (bg_rgb >> 8) & 0xFF, bg_rgb & 0xFF);
-        let fg = argb(alpha as u32, (fg_rgb >> 16) & 0xFF, (fg_rgb >> 8) & 0xFF, fg_rgb & 0xFF);
+        let bg = argb(
+            alpha as u32,
+            (bg_rgb >> 16) & 0xFF,
+            (bg_rgb >> 8) & 0xFF,
+            bg_rgb & 0xFF,
+        );
+        let fg = argb(
+            alpha as u32,
+            (fg_rgb >> 16) & 0xFF,
+            (fg_rgb >> 8) & 0xFF,
+            fg_rgb & 0xFF,
+        );
         draw_pill(hwnd, w, h, bg, fg, label);
     }
 }
@@ -340,9 +350,14 @@ unsafe fn gdiplus_init() {
 }
 
 /// 在 32bpp DIB 上用 GDI+ 绘制圆角胶囊 + 居中文字,经 ULW 提交。
+/// 内部按 SSAA 倍超采样绘制,再高质量缩到目标尺寸——
+/// 圆角和文字边缘比 1x 直接抗锯齿更细腻。
 unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
     unsafe {
-        // 1. 建 32-bit DIB(预乘 ARGB)
+        let big_w = w * SSAA;
+        let big_h = h * SSAA;
+
+        // 1. 建 32-bit 目标 DIB(预乘 ARGB),最终交给 ULW 的就是它
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -355,25 +370,21 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
             },
             ..Default::default()
         };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        let mut dst_bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut dst_bits, None, 0)
             .expect("CreateDIBSection 失败");
         // 全零 = 全透明起点
-        std::ptr::write_bytes(bits as *mut u8, 0, (w * h * 4) as usize);
+        std::ptr::write_bytes(dst_bits as *mut u8, 0, (w * h * 4) as usize);
 
-        let hdc = CreateCompatibleDC(None);
-        let old = SelectObject(hdc, hbmp.into());
-
-        // 2. GDI+ 绘制 —— 关键:scan0 必须指向 DIB 的内存,
-        //    否则 GDI+ 画进自己的内部缓冲,DIB 保持全零(全透明),
-        //    ULW 提交的就是一张看不见的空图。
+        // 2. SSAA 倍大位图:GDI+ 直接画进这块内存
+        let src_bits: Vec<u8> = vec![0u8; (big_w * big_h * 4) as usize];
         let mut bitmap = std::ptr::null_mut();
         let st = GdipCreateBitmapFromScan0(
-            w,
-            h,
-            w * 4,
+            big_w,
+            big_h,
+            big_w * 4,
             0xE200B, /* PixelFormat32bppPARGB */
-            Some(bits as *const u8),
+            Some(src_bits.as_ptr()),
             &mut bitmap as *mut _ as *mut *mut _,
         );
         if st != Status(0) {
@@ -386,17 +397,24 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
         let _ = GdipSetPixelOffsetMode(graphics, PixelOffsetModeHighQuality);
         let _ = GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAlias);
 
-        // 胶囊底(圆角矩形路径)
+        // 胶囊底(圆角矩形路径,坐标放大 SSAA 倍)
         let mut path = std::ptr::null_mut();
         let _ = GdipCreatePath(FillModeAlternate, &mut path);
-        add_round_rect(path, 0.0, 0.0, w as f32, h as f32, RADIUS);
+        add_round_rect(
+            path,
+            0.0,
+            0.0,
+            big_w as f32,
+            big_h as f32,
+            RADIUS * SSAA as f32,
+        );
         let mut brush = std::ptr::null_mut();
         let _ = GdipCreateSolidFill(bg, &mut brush);
         let _ = GdipFillPath(graphics, brush as *mut GpBrush, path);
         let _ = GdipDeleteBrush(brush as *mut GpBrush);
         let _ = GdipDeletePath(path);
 
-        // 居中文字
+        // 居中文字(字号同样放大)
         let mut family = std::ptr::null_mut();
         let _ = GdipCreateFontFamilyFromName(
             w!("Microsoft YaHei UI"),
@@ -404,7 +422,13 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
             &mut family,
         );
         let mut font = std::ptr::null_mut();
-        let _ = GdipCreateFont(family, FONT_SIZE_PX, FontStyleBold.0, UnitPixel, &mut font);
+        let _ = GdipCreateFont(
+            family,
+            FONT_SIZE_PX * SSAA as f32,
+            FontStyleBold.0,
+            UnitPixel,
+            &mut font,
+        );
         let mut fmt = std::ptr::null_mut();
         let _ = GdipCreateStringFormat(0, 0, &mut fmt);
         let _ = GdipSetStringFormatAlign(fmt, StringAlignmentCenter);
@@ -414,8 +438,8 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
         let layout = RectF {
             X: 0.0,
             Y: 0.0,
-            Width: w as f32,
-            Height: h as f32,
+            Width: big_w as f32,
+            Height: big_h as f32,
         };
         let text: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
         let _ = GdipDrawString(
@@ -432,9 +456,22 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
         let _ = GdipDeleteFont(font);
         let _ = GdipDeleteFontFamily(family);
         let _ = GdipDeleteGraphics(graphics);
+
+        // 3. 超采样位图 → 高质量缩放到目标 DIB
+        downsample_parbg(
+            src_bits.as_ptr(),
+            big_w,
+            big_h,
+            dst_bits as *mut u8,
+            w,
+            h,
+            SSAA,
+        );
         let _ = GdipDisposeImage(bitmap as *mut _);
 
-        // 3. 位图已是预乘格式,直接 ULW 提交
+        // 4. 目标位图已是预乘格式,选中后直接 ULW 提交
+        let hdc = CreateCompatibleDC(None);
+        let old = SelectObject(hdc, hbmp.into());
         let pt_src = POINT { x: 0, y: 0 };
         let size = SIZE { cx: w, cy: h };
         let blend = BLENDFUNCTION {
@@ -462,6 +499,45 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, bg: u32, fg: u32, label: &str) {
     }
 }
 
+/// 盒式下采样 2x 预乘 ARGB 到 1x:每个目标像素 = 2x2 源像素平均。
+/// 预乘格式下直接平均每分量即是正确的 alpha 混合。
+unsafe fn downsample_parbg(
+    src: *const u8,
+    big_w: i32,
+    _big_h: i32,
+    dst: *mut u8,
+    w: i32,
+    h: i32,
+    factor: i32,
+) {
+    unsafe {
+        let f = factor as usize;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let mut bgra = [0u32; 4];
+                for dy in 0..f {
+                    for dx in 0..f {
+                        let sx = x * f + dx;
+                        let sy = y * f + dy;
+                        let s = src.offset((sy * big_w as usize + sx) as isize * 4) as *const u32;
+                        let p = *s;
+                        bgra[0] += p & 0xFF;
+                        bgra[1] += (p >> 8) & 0xFF;
+                        bgra[2] += (p >> 16) & 0xFF;
+                        bgra[3] += (p >> 24) & 0xFF;
+                    }
+                }
+                let n = (f * f) as u32;
+                let d = dst.offset((y * w as usize + x) as isize * 4) as *mut u32;
+                *d = (bgra[0] / n)
+                    | ((bgra[1] / n) << 8)
+                    | ((bgra[2] / n) << 16)
+                    | ((bgra[3] / n) << 24);
+            }
+        }
+    }
+}
+
 /// 用四段圆弧拼圆角矩形路径
 unsafe fn add_round_rect(
     path: *mut windows::Win32::Graphics::GdiPlus::GpPath,
@@ -483,13 +559,14 @@ unsafe fn add_round_rect(
 }
 
 /// 计算屏幕居中坐标
+/// 计算窗口位置:水平居中,垂直方向在屏幕中心基础上再上移一段
 fn window_pos(w: i32, h: i32) -> POINT {
     unsafe {
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
         POINT {
             x: (sw - w) / 2,
-            y: (sh - h) / 2,
+            y: (sh - h) / 2 - LIFT_UP_PX,
         }
     }
 }
