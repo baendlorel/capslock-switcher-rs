@@ -12,15 +12,17 @@ use windows::Win32::UI::Input::Ime::{
     ImmReleaseContext, IME_CONVERSION_MODE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_LCONTROL,
-    VK_SPACE,
+    GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CAPITAL,
+    VK_LCONTROL, VK_LMENU, VK_OEM_3, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
     WM_IME_CONTROL,
 };
 
-use crate::overlay::{LangDisplay, LANG_EN, LANG_JA, LANG_KO, LANG_ZH};
+use crate::overlay::{
+    LangDisplay, LANG_EN, LANG_JA_KATAKANA, LANG_JA_HIRAGANA, LANG_KO, LANG_ZH,
+};
 
 // ---- IME 消息常量(windows crate 未导出,源自 imm.h) ----
 
@@ -49,17 +51,126 @@ mod primary_lang {
     pub const KOREAN: usize = 0x12;
 }
 
+// ---- 日语 MS-IME 转换模式位(imm.h) ----
+
+/// 本国语言输入位(置位 = 假名;清零 = 直接入力/英文)
+const IME_CMODE_NATIVE_JA: u32 = 0x0001;
+/// 片假名位(与 NATIVE 同置 = 片假名;仅 NATIVE = 平假名)
+const IME_CMODE_KATAKANA_JA: u32 = 0x0002;
+
+/// 日语 IME 三种输入模式
+enum JaMode {
+    /// 直接入力(英文)
+    Alpha,
+    /// 平假名(NATIVE | FULLSHAPE)
+    Hiragana,
+    /// 片假名(NATIVE | KATAKANA | FULLSHAPE)
+    Katakana,
+}
+
+/// 从转换模式位解析日语输入模式
+fn ja_mode_from_conv(conv: u32) -> JaMode {
+    if conv & IME_CMODE_NATIVE_JA == 0 {
+        JaMode::Alpha
+    } else if conv & IME_CMODE_KATAKANA_JA != 0 {
+        JaMode::Katakana
+    } else {
+        JaMode::Hiragana
+    }
+}
+
 /// 标记我们用 SendInput 注入的按键,避免钩子再次拦截造成死循环。
 pub(crate) const INJECTED_FLAG: usize = 0x1;
 
-/// 切换中/英模式。
-/// 实测(Win11 + 微软拼音,TSF 架构):IMM 两级通道的 SET 都会被静默忽略——
-/// L1 跨进程拿不到 HIMC;L2 WM_IME_CONTROL 返回成功但 IME 不执行。
-/// 因此这里不再信任 IMM 写入,直接走注入 Ctrl+Space(由 IME 自己的热键响应)。
+/// 切换入口:按前台输入法语言分派。
+/// - 日文 IME:三态轮切 英 → 平假名 → 片假名 → 英
+/// - 其他(中文/韩文/纯英文布局):注入 Ctrl+Space
 /// 只能在浮层线程调用(含阻塞调用,严禁放进低级钩子回调)。
 pub fn toggle_or_fallback() {
-    println!("[toggle] 走注入 Ctrl+Space 路径");
-    unsafe { send_ctrl_space() };
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            println!("[toggle] 无前台窗口,忽略");
+            return;
+        }
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let hkl = GetKeyboardLayout(fg_tid);
+        let primary = (hkl.0 as usize & LANGID_MASK) & PRIMARY_LANG_MASK;
+
+        if primary == primary_lang::JAPANESE {
+            toggle_japanese(fg);
+        } else {
+            println!("[toggle] 注入 Ctrl+Space");
+            send_key_tap(VK_LCONTROL.0, VK_SPACE.0);
+        }
+    }
+}
+
+/// 日语三态轮切:英 →(Ctrl+CapsLock)→ 平假名 →(Alt+CapsLock)→ 片假名 →(半角/全角)→ 英。
+/// 都是 MS-IME 的默认快捷键,由 IME 自己响应,不依赖 IMM 写入。
+unsafe fn toggle_japanese(fg: HWND) {
+    unsafe {
+        let mode = ja_mode_from_conv(current_conv_mode(fg));
+
+        match mode {
+            JaMode::Alpha => {
+                println!("[toggle] 日语:英 → 平假名 (注入 Ctrl+CapsLock)");
+                send_key_tap(VK_LCONTROL.0, VK_CAPITAL.0);
+            }
+            JaMode::Hiragana => {
+                println!("[toggle] 日语:平假名 → 片假名 (注入 Alt+CapsLock)");
+                send_key_tap(VK_LMENU.0, VK_CAPITAL.0);
+            }
+            JaMode::Katakana => {
+                println!("[toggle] 日语:片假名 → 英 (注入 半角/全角)");
+                // VK_OEM_3 即日式键盘的半角/全角键;单独一个键,无修饰键
+                send_key_tap(0, VK_OEM_3.0);
+            }
+        }
+    }
+}
+
+/// 读取前台窗口当前的转换模式原始值(只读,IMM 读通道可靠)。
+/// 读取失败返回 0(= 英文直入力)。
+unsafe fn current_conv_mode(fg: HWND) -> u32 {
+    unsafe {
+        // L1:AttachThreadInput 后直读输入上下文
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let my_tid = GetCurrentThreadId();
+        let attached = fg_tid != my_tid && AttachThreadInput(my_tid, fg_tid, true).as_bool();
+
+        let r = (|| {
+            let himc = ImmGetContext(fg);
+            if himc.is_invalid() {
+                return None;
+            }
+            let mut conv = IME_CONVERSION_MODE(0);
+            let got = ImmGetConversionStatus(himc, Some(&mut conv), None).as_bool();
+            let _ = ImmReleaseContext(fg, himc);
+            if got { Some(conv.0) } else { None }
+        })();
+
+        if attached {
+            let _ = AttachThreadInput(my_tid, fg_tid, false);
+        }
+
+        match r {
+            Some(v) => v,
+            // L2:问默认 IME 窗口
+            None => probe_ime_wnd_conv(fg).unwrap_or(0),
+        }
+    }
+}
+
+/// L2 读:IME 窗口的转换模式
+unsafe fn probe_ime_wnd_conv(fg: HWND) -> Option<u32> {
+    unsafe {
+        let ime = ImmGetDefaultIMEWnd(fg);
+        if ime.0.is_null() {
+            return None;
+        }
+        query(ime, IMC_GETCONVERSIONMODE).map(|v| v as u32)
+    }
 }
 
 /// 向 IME 窗口发只读查询,超时/失败返回 None(检测层在用)
@@ -93,16 +204,18 @@ pub fn detect_current_display() -> LangDisplay {
         let hkl = GetKeyboardLayout(fg_tid);
         let primary = (hkl.0 as usize & LANGID_MASK) & PRIMARY_LANG_MASK;
 
-        let (open, native) = probe_state(fg);
-
         match primary {
             primary_lang::CHINESE => {
+                let (open, native) = probe_state(fg);
                 if open && native { LANG_ZH } else { LANG_EN }
             }
-            primary_lang::JAPANESE => {
-                if open && native { LANG_JA } else { LANG_EN }
-            }
+            primary_lang::JAPANESE => match ja_mode_from_conv(current_conv_mode(fg)) {
+                JaMode::Alpha => LANG_EN,
+                JaMode::Hiragana => LANG_JA_HIRAGANA,
+                JaMode::Katakana => LANG_JA_KATAKANA,
+            },
             primary_lang::KOREAN => {
+                let (_, native) = probe_state(fg);
                 if native { LANG_KO } else { LANG_EN }
             }
             _ => LANG_EN,
@@ -165,9 +278,10 @@ unsafe fn probe_ime_wnd_read(fg: HWND) -> Option<(bool, bool)> {
     }
 }
 
-/// 注入一次完整的 Ctrl+Space 按下与松开(回退路径)
-unsafe fn send_ctrl_space() {
-    fn key(vk: u16, up: bool) -> INPUT {
+/// 注入一次完整的组合键按下与松开。
+/// `modifier` = 0 表示无修饰键(单键敲击)。
+unsafe fn send_key_tap(modifier: u16, key: u16) {
+    fn input(vk: u16, up: bool) -> INPUT {
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
@@ -186,12 +300,16 @@ unsafe fn send_ctrl_space() {
         }
     }
 
-    let inputs = [
-        key(VK_LCONTROL.0, false),
-        key(VK_SPACE.0, false),
-        key(VK_SPACE.0, true),
-        key(VK_LCONTROL.0, true),
-    ];
+    let inputs: Vec<INPUT> = if modifier == 0 {
+        vec![input(key, false), input(key, true)]
+    } else {
+        vec![
+            input(modifier, false),
+            input(key, false),
+            input(key, true),
+            input(modifier, true),
+        ]
+    };
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
 

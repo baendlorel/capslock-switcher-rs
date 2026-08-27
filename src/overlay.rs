@@ -134,9 +134,14 @@ pub const LANG_ZH: LangDisplay = LangDisplay {
     bg: hex(0xFF1F45),
     fg: hex(0xF7F8FA),
 };
-pub const LANG_JA: LangDisplay = LangDisplay {
+pub const LANG_JA_HIRAGANA: LangDisplay = LangDisplay {
     label: "あ",
     bg: hex(0xFFBF00),
+    fg: hex(0x212527),
+};
+pub const LANG_JA_KATAKANA: LangDisplay = LangDisplay {
+    label: "カ",
+    bg: hex(0xFF8C00),
     fg: hex(0x212527),
 };
 pub const LANG_KO: LangDisplay = LangDisplay {
