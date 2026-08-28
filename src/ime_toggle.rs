@@ -5,24 +5,24 @@
 //! L2: 向前台默认 IME 窗口发 WM_IME_CONTROL + IMC_SETCONVERSIONMODE
 //! 两级都失败时回退为注入 Ctrl+Space(由 hooks 完成)。
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::Ime::{
-    ImmGetContext, ImmGetConversionStatus, ImmGetDefaultIMEWnd, ImmGetOpenStatus,
-    ImmReleaseContext, IME_CONVERSION_MODE,
+    IME_CONVERSION_MODE, ImmGetContext, ImmGetConversionStatus, ImmGetDefaultIMEWnd,
+    ImmGetOpenStatus, ImmReleaseContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_CAPITAL,
-    VK_LCONTROL, VK_LMENU, VK_OEM_3, VK_SPACE,
+    GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    SendInput, VK_CAPITAL, VK_LCONTROL, VK_LMENU, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+    GetForegroundWindow, GetWindowThreadProcessId, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     WM_IME_CONTROL,
 };
 
-use crate::overlay::{
-    LangDisplay, LANG_EN, LANG_JA_KATAKANA, LANG_JA_HIRAGANA, LANG_KO, LANG_ZH,
-};
+use crate::overlay::{LANG_EN, LANG_JA_HIRAGANA, LANG_JA_KATAKANA, LANG_KO, LANG_ZH, LangDisplay};
 
 // ---- IME 消息常量(windows crate 未导出,源自 imm.h) ----
 
@@ -57,6 +57,20 @@ mod primary_lang {
 const IME_CMODE_NATIVE_JA: u32 = 0x0001;
 /// 片假名位(与 NATIVE 同置 = 片假名;仅 NATIVE = 平假名)
 const IME_CMODE_KATAKANA_JA: u32 = 0x0002;
+
+/// 上次已知(读成功或注入后乐观推进)的日语转换模式缓存。
+/// 读通道(AttachThreadInput/IME 窗口)在 TSF 应用(Electron、VS Code 等)
+/// 里经常双双失败——失败返回 0 会谎报「英」,导致轮切走错分支、
+/// 浮层连闪 En。失败时改用此缓存兜底;每次注入后乐观写入预期值,
+/// 保证读取持续失败时轮切依然正确步进。
+static LAST_JA_CONV: AtomicU32 = AtomicU32::new(0);
+
+/// 平假名的规范转换模式位(NATIVE | FULLSHAPE)
+const CONV_HIRAGANA: u32 = IME_CMODE_NATIVE_JA | 0x0008;
+/// 片假名的规范转换模式位(NATIVE | KATAKANA | FULLSHAPE)
+const CONV_KATAKANA: u32 = IME_CMODE_NATIVE_JA | IME_CMODE_KATAKANA_JA | 0x0008;
+/// 直接入力(英)的规范转换模式位
+const CONV_ALPHA: u32 = 0;
 
 /// 日语 IME 三种输入模式
 enum JaMode {
@@ -107,7 +121,8 @@ pub fn toggle_or_fallback() {
 }
 
 /// 日语三态轮切:英 →(Ctrl+CapsLock)→ 平假名 →(Alt+CapsLock)→ 片假名 →(半角/全角)→ 英。
-/// 都是 MS-IME 的默认快捷键,由 IME 自己响应,不依赖 IMM 写入。
+/// 英→平假名、平假名→片假名两步经实机验证有效,保持 VK 注入不动;
+/// 片假名→英一步改用扫描码注入(见下)。
 unsafe fn toggle_japanese(fg: HWND) {
     unsafe {
         let mode = ja_mode_from_conv(current_conv_mode(fg));
@@ -116,22 +131,61 @@ unsafe fn toggle_japanese(fg: HWND) {
             JaMode::Alpha => {
                 println!("[toggle] 日语:英 → 平假名 (注入 Ctrl+CapsLock)");
                 send_key_tap(VK_LCONTROL.0, VK_CAPITAL.0);
+                LAST_JA_CONV.store(CONV_HIRAGANA, Ordering::SeqCst);
             }
             JaMode::Hiragana => {
                 println!("[toggle] 日语:平假名 → 片假名 (注入 Alt+CapsLock)");
                 send_key_tap(VK_LMENU.0, VK_CAPITAL.0);
+                LAST_JA_CONV.store(CONV_KATAKANA, Ordering::SeqCst);
             }
             JaMode::Katakana => {
-                println!("[toggle] 日语:片假名 → 英 (注入 半角/全角)");
-                // VK_OEM_3 即日式键盘的半角/全角键;单独一个键,无修饰键
-                send_key_tap(0, VK_OEM_3.0);
+                println!("[toggle] 日语:片假名 → 英 (注入 半角/全角 sc029)");
+                send_scan_tap(0x0029, 0);
+                LAST_JA_CONV.store(CONV_ALPHA, Ordering::SeqCst);
             }
         }
     }
 }
 
+// ---- 扫描码注入 ----
+
+unsafe fn send_scan_tap(scan: u32, modifier: u32) {
+    fn input(scan: u32, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                    // 扫描码直接放 wScan(非扩展键);KEYEVENTF_UNICODE 时此域才是字符
+                    wScan: (scan & 0xFFFF) as u16,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP | KEYEVENTF_SCANCODE
+                    } else {
+                        KEYEVENTF_SCANCODE
+                    },
+                    time: 0,
+                    dwExtraInfo: INJECTED_FLAG,
+                },
+            },
+        }
+    }
+
+    let inputs: Vec<INPUT> = if modifier == 0 {
+        vec![input(scan, false), input(scan, true)]
+    } else {
+        vec![
+            input(modifier, false),
+            input(scan, false),
+            input(scan, true),
+            input(modifier, true),
+        ]
+    };
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+}
+
 /// 读取前台窗口当前的转换模式原始值(只读,IMM 读通道可靠)。
-/// 读取失败返回 0(= 英文直入力)。
+/// 两条读通道都失败时用上次成功读到的缓存兜底(而非谎报 0=英文);
+/// 从未成功读过时才返回 0。
 unsafe fn current_conv_mode(fg: HWND) -> u32 {
     unsafe {
         // L1:AttachThreadInput 后直读输入上下文
@@ -155,9 +209,23 @@ unsafe fn current_conv_mode(fg: HWND) -> u32 {
         }
 
         match r {
-            Some(v) => v,
+            Some(v) => {
+                LAST_JA_CONV.store(v, Ordering::SeqCst);
+                v
+            }
             // L2:问默认 IME 窗口
-            None => probe_ime_wnd_conv(fg).unwrap_or(0),
+            None => match probe_ime_wnd_conv(fg) {
+                Some(v) => {
+                    LAST_JA_CONV.store(v, Ordering::SeqCst);
+                    v
+                }
+                // 两级都失败:用缓存,别谎报
+                None => {
+                    let cached = LAST_JA_CONV.load(Ordering::SeqCst);
+                    println!("[toggle] 读转换模式失败,用缓存兜底: {cached:#x}");
+                    cached
+                }
+            },
         }
     }
 }
@@ -312,4 +380,3 @@ unsafe fn send_key_tap(modifier: u16, key: u16) {
     };
     unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 }
-
