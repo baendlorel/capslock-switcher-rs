@@ -5,19 +5,32 @@
 //! 铁律:钩子回调里只做 O(1) 的判断和 PostMessage,任何阻塞调用
 //! (AttachThreadInput/SendMessageTimeout/SendInput)都会让系统超时摘钩。
 
-use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CAPITAL, VK_LMENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_INJECTED, LLKHF_UP, MSG,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::overlay;
+use crate::tray;
+
+/// 钩子线程 ID(供 tray 通知退出)
+static HOOK_TID: AtomicU32 = AtomicU32::new(0);
+
+/// 通知钩子线程退出
+pub fn post_quit() {
+    let tid = HOOK_TID.load(Ordering::SeqCst);
+    if tid != 0 {
+        let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    }
+}
 
 // 标记注入按键的 dwExtraInfo(注入逻辑在 ime_toggle,此处仅识别)
 use crate::ime_toggle::INJECTED_FLAG;
@@ -40,6 +53,9 @@ static CAPS_PHYS_DOWN: AtomicBool = AtomicBool::new(false);
 /// 安装低级键盘钩子并进入消息循环,阻塞直到收到 WM_QUIT。
 pub unsafe fn run() {
     unsafe {
+        // 记录线程 ID 供 tray 通知退出
+        HOOK_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
+
         // 同步一次系统当前的大小写状态作为跟踪初值
         CAPS_ON.store(
             GetKeyState(VK_CAPITAL.0 as i32) & KEYSTATE_TOGGLED != 0,
@@ -65,6 +81,11 @@ pub unsafe fn run() {
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if code < 0 {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
+        // 托盘"停止"时放行所有按键,CapsLock 恢复原生行为
+        if !tray::is_enabled() {
             return CallNextHookEx(None, code, wparam, lparam);
         }
 

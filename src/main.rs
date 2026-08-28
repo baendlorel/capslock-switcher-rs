@@ -3,6 +3,7 @@
 mod hooks;
 mod ime_toggle;
 mod overlay;
+mod tray;
 
 fn main() {
     // 按物理像素 1:1 渲染:否则在 125%/150% 缩放的屏幕上,
@@ -20,6 +21,9 @@ fn main() {
 
     // overlay 窗口线程常驻,负责显示/隐藏语言指示浮层
     overlay::spawn_thread();
+
+    // 系统托盘线程:图标 + 右键菜单(启用/停止、退出)
+    tray::spawn_thread();
 
     hook_thread.join().unwrap();
     overlay::post_quit();
