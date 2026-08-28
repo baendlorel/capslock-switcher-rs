@@ -10,7 +10,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetMessageW, LoadIconW, MF_CHECKED, MF_STRING, MSG, PostMessageW,
+    DispatchMessageW, GetMessageW, LoadIconW, MF_STRING, MSG, PostMessageW,
     PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TPM_BOTTOMALIGN,
     TPM_RIGHTALIGN, WM_COMMAND, WM_DESTROY, WM_USER, WNDCLASSW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
@@ -167,8 +167,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
             .chain(std::iter::once(0))
             .collect();
 
-        let flags = if enabled { MF_STRING | MF_CHECKED } else { MF_STRING };
-        let _ = AppendMenuW(menu, flags, IDM_TOGGLE as usize, PCWSTR(toggle_text.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE as usize, PCWSTR(toggle_text.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_text.as_ptr()));
 
         // TrackPopupMenu 需要 SetForegroundWindow 才能在点击外部时关闭
