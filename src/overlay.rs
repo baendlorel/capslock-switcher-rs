@@ -19,7 +19,8 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeleteStringFormat,
     GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext,
     GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
-    GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusStartup, GdiplusStartupInput,
+    GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusShutdown, GdiplusStartup,
+    GdiplusStartupInput,
     GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias, Status,
     StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
 };
@@ -238,6 +239,11 @@ unsafe fn message_loop() {
         }
     }
     OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::SeqCst);
+
+    // 清理 GDI+ 资源,防止动态重初始化时状态冲突
+    unsafe {
+        let _ = GdiplusShutdown(GDIPLUS_TOKEN);
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -420,6 +426,8 @@ unsafe fn draw_pill(hwnd: HWND, w: i32, h: i32, font_h: f32, bg: u32, fg: u32, l
         );
         if st != GDIP_OK {
             eprintln!("[overlay] GdipCreateBitmapFromScan0 失败: {st:?}");
+            let _ = DeleteObject(hbmp.into());
+            return;
         }
 
         let mut graphics = std::ptr::null_mut();

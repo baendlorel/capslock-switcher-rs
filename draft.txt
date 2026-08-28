@@ -16,3 +16,49 @@
     如果现在是片假名，则按一下切回英文模式。但我不知到英文模式快捷键，如果你也不知道，请询问我该怎么办
 
     想要实现这个，需要在按下capslock后先判定现在是什么语言的输入法才行
+===== 风险扫描报告 =====
+
+===== 风险扫描报告 =====
+
+【风险等级说明】
+  🔴 严重 - 可能导致崩溃/数据损坏
+  🟡 中等 - 可能导致功能异常或可靠性质疑
+  🟢 低 - 建议改进
+
+--- 严重 ---
+
+1. 误判修正：overlay.rs draw_pill() 中 GdipDisposeImage 与 downsample_parbg 的顺序
+   实际代码顺序是正确的（先读取 src_bits 下采样，再释放 GDI+ bitmap），
+   不存在 use-after-free。之前报告有误，特此更正。
+
+2. GdipCreateBitmapFromScan0 失败时无保护（overlay.rs draw_pill）
+   若 GdipCreateBitmapFromScan0 失败，bitmap 为 null，后续 GdipGetImageGraphicsContext 会访问违例。
+   当前仅在 st != GDIP_OK 时 eprintln 但继续执行，未提前返回或清理已分配的 hbmp。
+
+3. GdiplusStartup 后无 GdiplusShutdown（overlay.rs）
+   gdiplus_init() 仅调用 GdiplusStartup，spawn_thread() 消息循环退出后未调用 GdiplusShutdown。
+   常驻进程退出时 OS 会回收，但若将来加入动态重初始化逻辑则会触发 GDI+ 状态冲突。
+
+--- 中等 ---
+
+4. SendInput 返回值未检查（ime_toggle.rs send_key_tap）
+   SendInput 返回实际注入的事件数。若返回 0（UIPI 拦截、权限不足），调用方无法感知失败，
+   用户按 CapsLock 但输入法未切换。
+
+5. Alt 键状态初始化偏差（hooks.rs）
+   ALT_DOWN 初始为 0。若钩子安装时 Alt 已按下，直到 Alt 被释放再按下才恢复正常。
+   但有 LLKHF_ALTDOWN 标志位作为双重保险，实际影响有限。
+
+--- 低 ---
+
+6. render_frame 每帧锁定 CUR_LANG Mutex（overlay.rs）
+   频繁加锁但仅在同一线程内使用，无实际多线程竞争。可用 Atomic 替代，但非崩溃风险。
+
+7. UnhookWindowsHookEx 返回值未检查（hooks.rs）
+   基本不会失败，失败仅导致钩子残留到进程退出。
+
+===== 修复建议 =====
+
+建议优先修复第 2、3 项：
+  - 第 2 项：GdipCreateBitmapFromScan0 失败时加 DeleteObject(hbmp.into()) 和 return。
+  - 第 3 项：spawn_thread 消息循环退出后（OVERLAY_HWND.store 之后）调用 GdiplusShutdown。
