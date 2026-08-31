@@ -29,7 +29,8 @@ const WM_TRAY_ICON: u32 = WM_USER + 1;
 /// 菜单命令 ID
 const IDM_TOGGLE: u32 = 1;
 const IDM_AUTOSTART: u32 = 2;
-const IDM_EXIT: u32 = 3;
+const IDM_ABOUT: u32 = 3;
+const IDM_EXIT: u32 = 4;
 
 pub fn spawn_thread() {
     std::thread::spawn(|| unsafe { tray_loop() });
@@ -157,6 +158,9 @@ unsafe extern "system" fn tray_wnd_proc(
                             }
                         );
                     }
+                    IDM_ABOUT => {
+                        crate::about::show();
+                    }
                     IDM_EXIT => {
                         // 通知 hooks 线程退出
                         crate::hooks::post_quit();
@@ -190,6 +194,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        let about_text: Vec<u16> = "关于".encode_utf16().chain(std::iter::once(0)).collect();
         let exit_text: Vec<u16> = "退出".encode_utf16().chain(std::iter::once(0)).collect();
 
         let _ = AppendMenuW(
@@ -209,6 +214,12 @@ unsafe fn show_context_menu(hwnd: HWND) {
             autostart_flag,
             IDM_AUTOSTART as usize,
             PCWSTR(autostart_text.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_ABOUT as usize,
+            PCWSTR(about_text.as_ptr()),
         );
         let _ = AppendMenuW(
             menu,

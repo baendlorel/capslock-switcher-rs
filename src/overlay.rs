@@ -17,11 +17,12 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromScan0, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreatePath,
     GdipCreateSolidFill, GdipCreateStringFormat, GdipDeleteBrush, GdipDeleteFont,
     GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath, GdipDeleteStringFormat,
-    GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext,
-    GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
-    GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusShutdown, GdiplusStartup,
-    GdiplusStartupInput, GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias,
-    Status, StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
+    GdipDisposeImage, GdipDrawImageRect, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext,
+    GdipGetImageHeight, GdipGetImageWidth, GdipSetInterpolationMode, GdipSetPixelOffsetMode,
+    GdipSetSmoothingMode, GdipSetStringFormatAlign, GdipSetStringFormatLineAlign,
+    GdipSetTextRenderingHint, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap,
+    GpBrush, GpImage, InterpolationModeHighQualityBicubic, PixelOffsetModeHighQuality, RectF,
+    SmoothingModeAntiAlias, Status, StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -34,6 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
+use crate::assets;
 use crate::ime_toggle;
 
 // ---- 可视参数 ----
@@ -48,6 +50,8 @@ const TEXT_H_RATIO: f32 = 0.48;
 const RADIUS: f32 = 16.0;
 /// 浮层中心相对屏幕中心的上移量(像素)
 const LIFT_UP_PX: i32 = 120;
+/// 就绪提示图片宽度相对屏幕宽度的比例(高度按图片原始宽高比换算)
+const IMAGE_W_RATIO: f32 = 0.14;
 /// 超采样倍数:按 2x 尺寸绘制,提交前高质量下采样到 1x,
 /// 边缘比单纯抗锯齿更细腻(2560x1440@100% 也看不出颗粒)。
 const SSAA: i32 = 2;
@@ -79,6 +83,29 @@ fn metrics() -> Metrics {
     }
 }
 
+/// 图片浮层的尺寸度量:宽度按屏幕比例,高度按图片原始宽高比换算。
+struct ImageMetrics {
+    w: i32,
+    h: i32,
+}
+
+fn image_metrics(bitmap: *mut GpBitmap) -> ImageMetrics {
+    unsafe {
+        let mut iw: u32 = 0;
+        let mut ih: u32 = 0;
+        let _ = GdipGetImageWidth(bitmap as *mut GpImage, &mut iw);
+        let _ = GdipGetImageHeight(bitmap as *mut GpImage, &mut ih);
+        let sw = GetSystemMetrics(SM_CXSCREEN) as f32;
+        let w = (sw * IMAGE_W_RATIO).round() as i32;
+        let aspect = if iw > 0 { ih as f32 / iw as f32 } else { 1.0 };
+        let h = ((w as f32) * aspect).round() as i32;
+        ImageMetrics {
+            w: w.max(1),
+            h: h.max(1),
+        }
+    }
+}
+
 // ---- 计时器 ID ----
 const TIMER_READ: usize = 1;
 const TIMER_ANIM: usize = 2;
@@ -94,7 +121,17 @@ static OVERLAY_HWND: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::nul
 static OVERLAY_TID: AtomicU32 = AtomicU32::new(0);
 /// 动画起点(毫秒时钟);0 = 未在显示
 static ANIM_START: AtomicU64 = AtomicU64::new(0);
-static CUR_LANG: Mutex<LangDisplay> = Mutex::new(LANG_EN);
+
+/// 浮层当前展示内容:文字胶囊或就绪提示图片
+#[derive(Clone, Copy)]
+enum OverlayContent {
+    Pill(LangDisplay),
+    Image,
+}
+
+static CUR_CONTENT: Mutex<OverlayContent> = Mutex::new(OverlayContent::Pill(LANG_EN));
+/// 就绪提示图片(启动完成后展示,进程生命周期内常驻,浮层线程退出时释放)
+static mut READY_IMAGE: *mut GpBitmap = std::ptr::null_mut();
 
 // ---- 状态定义 ----
 
@@ -124,11 +161,12 @@ pub struct LangDisplay {
     pub fg: u32,
 }
 
-pub const ON: LangDisplay = LangDisplay {
-    label: "开",
-    bg: hex(0x212527),
-    fg: hex(0xF7F8FA),
-};
+impl Copy for LangDisplay {}
+impl Clone for LangDisplay {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 
 pub const LANG_EN: LangDisplay = LangDisplay {
     label: "En",
@@ -205,6 +243,7 @@ unsafe fn message_loop() {
     OVERLAY_TID.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
 
     unsafe { gdiplus_init() };
+    unsafe { READY_IMAGE = assets::load_bitmap(assets::UMBRAL_KEYS_PNG) };
 
     let hinst = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW 失败");
     let wc = WNDCLASSW {
@@ -237,8 +276,8 @@ unsafe fn message_loop() {
 
     OVERLAY_HWND.store(hwnd.0, Ordering::SeqCst);
 
-    // 程序启动就绪:显示一次"开"状态提示
-    unsafe { on_request_show_with(hwnd, ON) };
+    // 程序启动就绪:显示一次提示图片
+    unsafe { on_request_show_content(hwnd, OverlayContent::Image) };
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -250,6 +289,10 @@ unsafe fn message_loop() {
 
     // 清理 GDI+ 资源,防止动态重初始化时状态冲突
     unsafe {
+        if !READY_IMAGE.is_null() {
+            let _ = GdipDisposeImage(READY_IMAGE as *mut _);
+            READY_IMAGE = std::ptr::null_mut();
+        }
         let _ = GdiplusShutdown(GDIPLUS_TOKEN);
     }
 }
@@ -273,7 +316,7 @@ unsafe extern "system" fn wnd_proc(
             WM_APP_CAPS => {
                 let caps_on = lparam.0 != 0;
                 let lang = if caps_on { LANG_CAPS_ON } else { LANG_CAPS_OFF };
-                on_request_show_with(hwnd, lang);
+                on_request_show_content(hwnd, OverlayContent::Pill(lang));
                 LRESULT(0)
             }
             WM_TIMER => {
@@ -299,11 +342,11 @@ unsafe fn on_request_show(hwnd: HWND) {
 }
 
 /// 收到显示请求(内容已定,无需检测):直接显示
-unsafe fn on_request_show_with(hwnd: HWND, lang: LangDisplay) {
+unsafe fn on_request_show_content(hwnd: HWND, content: OverlayContent) {
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER_READ);
         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-        *CUR_LANG.lock().unwrap() = lang;
+        *CUR_CONTENT.lock().unwrap() = content;
         layout_window(hwnd);
         render_frame(hwnd, 255);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -318,7 +361,8 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
             TIMER_READ => {
                 let _ = KillTimer(Some(hwnd), TIMER_READ);
                 // 重新检测一次(等 IME 落定后的真实状态)再上屏
-                *CUR_LANG.lock().unwrap() = ime_toggle::detect_current_display();
+                *CUR_CONTENT.lock().unwrap() =
+                    OverlayContent::Pill(ime_toggle::detect_current_display());
                 layout_window(hwnd);
                 render_frame(hwnd, 255);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -354,27 +398,29 @@ unsafe fn on_timer(hwnd: HWND, id: usize) {
 
 // ---- 渲染(GDI+ → 预乘 ARGB DIB → UpdateLayeredWindow) ----
 
-/// 每帧重绘:胶囊底 + 文字,整体乘 alpha 后经 ULW 提交。
+/// 每帧重绘:胶囊底 + 文字,整体乘 alpha 后经 ULW 提交(或提示图片,同一动画节奏)。
 unsafe fn render_frame(hwnd: HWND, alpha: u8) {
     unsafe {
-        let (label, bg_rgb, fg_rgb) = {
-            let lang = CUR_LANG.lock().unwrap();
-            (lang.label, lang.bg, lang.fg)
-        };
-        let m = metrics();
-        let bg = argb(
-            alpha as u32,
-            (bg_rgb >> 16) & COLOR_CHANNEL_MASK,
-            (bg_rgb >> 8) & COLOR_CHANNEL_MASK,
-            bg_rgb & COLOR_CHANNEL_MASK,
-        );
-        let fg = argb(
-            alpha as u32,
-            (fg_rgb >> 16) & COLOR_CHANNEL_MASK,
-            (fg_rgb >> 8) & COLOR_CHANNEL_MASK,
-            fg_rgb & COLOR_CHANNEL_MASK,
-        );
-        draw_pill(hwnd, m.w, m.h, m.font_h, bg, fg, label);
+        let content = *CUR_CONTENT.lock().unwrap();
+        match content {
+            OverlayContent::Pill(lang) => {
+                let m = metrics();
+                let bg = argb(
+                    alpha as u32,
+                    (lang.bg >> 16) & COLOR_CHANNEL_MASK,
+                    (lang.bg >> 8) & COLOR_CHANNEL_MASK,
+                    lang.bg & COLOR_CHANNEL_MASK,
+                );
+                let fg = argb(
+                    alpha as u32,
+                    (lang.fg >> 16) & COLOR_CHANNEL_MASK,
+                    (lang.fg >> 8) & COLOR_CHANNEL_MASK,
+                    lang.fg & COLOR_CHANNEL_MASK,
+                );
+                draw_pill(hwnd, m.w, m.h, m.font_h, bg, fg, lang.label);
+            }
+            OverlayContent::Image => draw_image(hwnd, alpha),
+        }
     }
 }
 
@@ -627,18 +673,130 @@ fn window_pos(w: i32, h: i32) -> POINT {
 /// 设定窗口位置与尺寸(尺寸由屏幕比例决定,与文字内容无关)
 unsafe fn layout_window(hwnd: HWND) {
     unsafe {
-        let m = metrics();
-        let pos = window_pos(m.w, m.h);
+        let (w, h) = match *CUR_CONTENT.lock().unwrap() {
+            OverlayContent::Pill(_) => {
+                let m = metrics();
+                (m.w, m.h)
+            }
+            OverlayContent::Image => {
+                let m = image_metrics(READY_IMAGE);
+                (m.w, m.h)
+            }
+        };
+        let pos = window_pos(w, h);
         // SetWindowPos 触发 ULW 尺寸变化;位置每次都重设(屏幕可能变了)
         let _ = SetWindowPos(
             hwnd,
             None,
             pos.x,
             pos.y,
-            m.w,
-            m.h,
+            w,
+            h,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// 绘制就绪提示图片:直接在目标 DIB 上用 GDI+ 缩放绘制,再整体乘 alpha 做淡出。
+unsafe fn draw_image(hwnd: HWND, alpha: u8) {
+    unsafe {
+        let bitmap = READY_IMAGE;
+        if bitmap.is_null() {
+            return;
+        }
+        let m = image_metrics(bitmap);
+        let (w, h) = (m.w, m.h);
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut dst_bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut dst_bits, None, 0)
+            .expect("CreateDIBSection 失败");
+        std::ptr::write_bytes(dst_bits as *mut u8, 0, (w * h * 4) as usize);
+
+        // 直接把 DIB 内存包装成 GDI+ 位图,绘制结果落在同一块内存上,无需额外拷贝
+        let mut canvas = std::ptr::null_mut();
+        let st = GdipCreateBitmapFromScan0(
+            w,
+            h,
+            w * 4,
+            PIXEL_FORMAT_32BPP_PARGB,
+            Some(dst_bits as *const u8),
+            &mut canvas as *mut _ as *mut *mut _,
+        );
+        if st != GDIP_OK {
+            eprintln!("[overlay] GdipCreateBitmapFromScan0 失败: {st:?}");
+            let _ = DeleteObject(hbmp.into());
+            return;
+        }
+
+        let mut graphics = std::ptr::null_mut();
+        let _ = GdipGetImageGraphicsContext(canvas as *mut _, &mut graphics);
+        let _ = GdipSetInterpolationMode(graphics, InterpolationModeHighQualityBicubic);
+        let _ = GdipDrawImageRect(
+            graphics,
+            bitmap as *mut GpImage,
+            0.0,
+            0.0,
+            w as f32,
+            h as f32,
+        );
+        let _ = GdipDeleteGraphics(graphics);
+        let _ = GdipDisposeImage(canvas as *mut _);
+
+        scale_alpha(dst_bits as *mut u8, w, h, alpha);
+
+        let hdc = CreateCompatibleDC(None);
+        let old = SelectObject(hdc, hbmp.into());
+        let pt_src = POINT { x: 0, y: 0 };
+        let size = SIZE { cx: w, cy: h };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let pt_dst = window_pos(w, h);
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&pt_dst),
+            Some(&size),
+            Some(hdc),
+            Some(&pt_src),
+            Default::default(),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteDC(hdc);
+        let _ = DeleteObject(hbmp.into());
+    }
+}
+
+/// 按 alpha/255 整体缩放预乘 ARGB 四通道,实现淡出(255 时原样跳过)。
+fn scale_alpha(bits: *mut u8, w: i32, h: i32, alpha: u8) {
+    if alpha == 255 {
+        return;
+    }
+    unsafe {
+        let n = (w * h * 4) as usize;
+        let a = alpha as u32;
+        let slice = std::slice::from_raw_parts_mut(bits, n);
+        for b in slice.iter_mut() {
+            *b = ((*b as u32 * a) / 255) as u8;
+        }
     }
 }
 

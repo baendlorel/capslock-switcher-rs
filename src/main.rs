@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
+mod about;
+mod assets;
 mod autostart;
 mod hooks;
 mod ime_toggle;
