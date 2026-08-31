@@ -20,9 +20,8 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipDisposeImage, GdipDrawString, GdipFillPath, GdipGetImageGraphicsContext,
     GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdipSetStringFormatAlign,
     GdipSetStringFormatLineAlign, GdipSetTextRenderingHint, GdiplusShutdown, GdiplusStartup,
-    GdiplusStartupInput,
-    GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias, Status,
-    StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
+    GdiplusStartupInput, GpBrush, PixelOffsetModeHighQuality, RectF, SmoothingModeAntiAlias,
+    Status, StringAlignmentCenter, TextRenderingHintAntiAlias, UnitPixel,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -124,6 +123,12 @@ pub struct LangDisplay {
     /// 文字颜色
     pub fg: u32,
 }
+
+pub const ON: LangDisplay = LangDisplay {
+    label: "开",
+    bg: hex(0xF7F8FA),
+    fg: hex(0x212527),
+};
 
 pub const LANG_EN: LangDisplay = LangDisplay {
     label: "En",
@@ -231,6 +236,9 @@ unsafe fn message_loop() {
     .expect("创建浮层窗口失败");
 
     OVERLAY_HWND.store(hwnd.0, Ordering::SeqCst);
+
+    // 程序启动就绪:显示一次"开"状态提示
+    unsafe { on_request_show_with(hwnd, ON) };
 
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
