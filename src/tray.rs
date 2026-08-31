@@ -10,9 +10,9 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetMessageW, LoadIconW, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TPM_BOTTOMALIGN,
-    TPM_RIGHTALIGN, WM_COMMAND, WM_DESTROY, WM_USER, WNDCLASSW, WS_EX_NOACTIVATE,
+    DispatchMessageW, GetMessageW, LoadIconW, MF_CHECKED, MF_STRING, MF_UNCHECKED, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TPM_BOTTOMALIGN,
+    TPM_RIGHTALIGN, TrackPopupMenu, WM_COMMAND, WM_DESTROY, WM_USER, WNDCLASSW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -28,7 +28,8 @@ static TRAY_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
 const WM_TRAY_ICON: u32 = WM_USER + 1;
 /// 菜单命令 ID
 const IDM_TOGGLE: u32 = 1;
-const IDM_EXIT: u32 = 2;
+const IDM_AUTOSTART: u32 = 2;
+const IDM_EXIT: u32 = 3;
 
 pub fn spawn_thread() {
     std::thread::spawn(|| unsafe { tray_loop() });
@@ -133,7 +134,28 @@ unsafe extern "system" fn tray_wnd_proc(
                         let was_enabled = ENABLED.fetch_xor(true, Ordering::SeqCst);
                         let now_enabled = !was_enabled;
                         update_tray_tip(now_enabled);
-                        println!("[tray] {}", if now_enabled { "已启用" } else { "已停止" });
+                        println!(
+                            "[tray] {}",
+                            if now_enabled {
+                                "已启用"
+                            } else {
+                                "已停止"
+                            }
+                        );
+                    }
+                    IDM_AUTOSTART => {
+                        let target = !crate::autostart::is_enabled();
+                        let ok = crate::autostart::set_enabled(target);
+                        println!(
+                            "[tray] 开机启动(管理员) {}",
+                            if !ok {
+                                "操作失败"
+                            } else if target {
+                                "已开启"
+                            } else {
+                                "已关闭"
+                            }
+                        );
                     }
                     IDM_EXIT => {
                         // 通知 hooks 线程退出
@@ -158,17 +180,42 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let enabled = is_enabled();
         let menu = CreatePopupMenu().expect("CreatePopupMenu 失败");
 
+        let autostart_enabled = crate::autostart::is_enabled();
+
         let toggle_text: Vec<u16> = (if enabled { "停止" } else { "启用" })
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let exit_text: Vec<u16> = "退出"
+        let autostart_text: Vec<u16> = "开机启动(管理员)"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        let exit_text: Vec<u16> = "退出".encode_utf16().chain(std::iter::once(0)).collect();
 
-        let _ = AppendMenuW(menu, MF_STRING, IDM_TOGGLE as usize, PCWSTR(toggle_text.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_text.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_TOGGLE as usize,
+            PCWSTR(toggle_text.as_ptr()),
+        );
+        let autostart_flag = MF_STRING
+            | if autostart_enabled {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            };
+        let _ = AppendMenuW(
+            menu,
+            autostart_flag,
+            IDM_AUTOSTART as usize,
+            PCWSTR(autostart_text.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_EXIT as usize,
+            PCWSTR(exit_text.as_ptr()),
+        );
 
         // TrackPopupMenu 需要 SetForegroundWindow 才能在点击外部时关闭
         let _ = SetForegroundWindow(hwnd);
@@ -177,7 +224,15 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
 
-        let _ = TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, Some(0), hwnd, None);
+        let _ = TrackPopupMenu(
+            menu,
+            TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
+            pt.x,
+            pt.y,
+            Some(0),
+            hwnd,
+            None,
+        );
         let _ = DestroyMenu(menu);
     }
 }

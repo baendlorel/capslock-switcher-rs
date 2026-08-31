@@ -126,8 +126,8 @@ pub struct LangDisplay {
 
 pub const ON: LangDisplay = LangDisplay {
     label: "开",
-    bg: hex(0xF7F8FA),
-    fg: hex(0x212527),
+    bg: hex(0x212527),
+    fg: hex(0xF7F8FA),
 };
 
 pub const LANG_EN: LangDisplay = LangDisplay {
