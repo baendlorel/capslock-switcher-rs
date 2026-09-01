@@ -32,7 +32,7 @@ use crate::assets;
 const WINDOW_W: i32 = 440;
 const PADDING: i32 = 24;
 /// 图片显示宽度(高度按原始宽高比换算)
-const IMAGE_W: i32 = 320;
+const IMAGE_W: i32 = 180;
 /// 图片与文字之间的间距
 const IMG_TEXT_GAP: i32 = 16;
 /// 正文字号
@@ -50,7 +50,7 @@ struct Paragraph {
 
 const PARAGRAPHS: [Paragraph; 4] = [
     Paragraph {
-        text: "请先将中英文输入法切换键改为ctrl+space，方可使用本软件。",
+        text: "使用前请先将中英文输入法切换键设为 Ctrl+Space。",
         bold: true,
         space_after: 16,
     },
@@ -60,12 +60,12 @@ const PARAGRAPHS: [Paragraph; 4] = [
         space_after: 6,
     },
     Paragraph {
-        text: "CapsLock：切换中英文输入法，如果是日语输入法，则切换平假名/片假名/英文模式。",
+        text: "CapsLock：切换中英文；日语输入法下切换平假名/片假名/英文。",
         bold: false,
         space_after: 4,
     },
     Paragraph {
-        text: "Alt+CapsLock：原本的CapsLock功能。",
+        text: "Alt+CapsLock：原生大小写锁定。",
         bold: false,
         space_after: 0,
     },
