@@ -5,7 +5,7 @@ use windows::Win32::Graphics::GdiPlus::{GdipCreateBitmapFromStream, GpBitmap, St
 use windows::Win32::System::Com::STREAM_SEEK_SET;
 use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
 
-/// 内嵌的 umbral-keys.png 字节(启动就绪浮层 + 关于窗口左侧图共用)
+/// 内嵌的 umbral-keys.png 字节(启动就绪浮层 + 关于窗口左侧图 + 用前必读窗口顶部图共用)
 pub static UMBRAL_KEYS_PNG: &[u8] = include_bytes!("../assets/umbral-keys.png");
 
 /// 从内存字节加载 GDI+ 位图;调用方负责后续 GdipDisposeImage 释放。失败返回空指针。

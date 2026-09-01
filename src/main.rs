@@ -7,6 +7,7 @@ mod autostart;
 mod hooks;
 mod ime_toggle;
 mod overlay;
+mod readme;
 mod tray;
 
 fn main() {

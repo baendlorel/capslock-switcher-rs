@@ -62,3 +62,16 @@
 建议优先修复第 2、3 项：
   - 第 2 项：GdipCreateBitmapFromScan0 失败时加 DeleteObject(hbmp.into()) 和 return。
   - 第 3 项：spawn_thread 消息循环退出后（OVERLAY_HWND.store 之后）调用 GdiplusShutdown。
+
+
+增加“用前必读”窗口，
+使用说明窗口整体的样式大致为：
+1、上下结构，上方是居中的assets\umbral-keys.png，宽度缩减为320px。下方是说明文本
+2、内容为：
+```text
+请先将中英文输入法切换键改为ctrl+space，方可使用本软件。
+快捷键：
+CapsLock：切换中英文输入法，如果是日语输入法，则切换平假名/片假名/英文模式。
+Alt+CapsLock：原本的CapsLock功能。
+
+```
